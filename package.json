@@ -1,6 +1,6 @@
 {
   "name": "create-vumlo",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Interactive installer for Vumlo: unpacks a release with only the parts you pick.",
   "type": "module",
   "bin": {

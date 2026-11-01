@@ -43,3 +43,14 @@ assert.deepEqual(parseDomains("Example.edu, @cs.example.edu ,"), ["example.edu",
 assert.deepEqual(parseDomains(""), []);
 assert.throws(() => parseDomains("not a domain"), /not an email domain/);
 console.log("ok (0.2.0)");
+
+// `npx` runs the program through a symlink: it must still start (0.1.0 and 0.2.0 silently did nothing then).
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const link = join(mkdtempSync(join(tmpdir(), "create-vumlo-")), "create-vumlo");
+symlinkSync(new URL("./index.mjs", import.meta.url).pathname, link);
+const run = (extra) => { try { return execFileSync(process.execPath, [link, ...extra], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); } catch (e) { return `${e.stdout}${e.stderr}`; } };
+assert.match(run(["--archive", "/nonexistent.tar.gz", "--dir", join(tmpdir(), "create-vumlo-never"), "--yes"]), /Vumlo installer/, "the program did not start through a symlink");
+console.log("ok (symlink)");
