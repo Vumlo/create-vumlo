@@ -1,0 +1,35 @@
+{
+  "name": "create-vumlo",
+  "version": "0.2.0",
+  "description": "Interactive installer for Vumlo: unpacks a release with only the parts you pick.",
+  "type": "module",
+  "bin": {
+    "create-vumlo": "index.mjs"
+  },
+  "files": [
+    "index.mjs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@clack/prompts": "^1.8.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vumlo/create-vumlo.git"
+  },
+  "homepage": "https://github.com/Vumlo/create-vumlo#readme",
+  "bugs": {
+    "url": "https://github.com/Vumlo/create-vumlo/issues"
+  },
+  "keywords": [
+    "vumlo",
+    "lms",
+    "installer"
+  ]
+}
