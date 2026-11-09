@@ -44,6 +44,17 @@ assert.deepEqual(parseDomains(""), []);
 assert.throws(() => parseDomains("not a domain"), /not an email domain/);
 console.log("ok (0.2.0)");
 
+// 0.3.0: the accent. The real example only has the line from release 0.5.0 on, so the text is built here.
+const base = { name: "X", mode: "school", origin: "http://localhost:3000", modules: [] };
+const withAccent = read("vumlo.example.toml").replace(/^# short_name = .*$/m, (l) => `${l}\n# accent = "violet"`);
+assert.match(patchToml(withAccent, { ...base, accent: "teal" }), /^accent = "teal"$/m);
+assert.match(patchToml(withAccent, { ...base, accent: "violet" }), /^# accent = "violet"$/m);
+assert.match(patchToml(withAccent, base), /^# accent = "violet"$/m);
+const noAccent = withAccent.replace(/^# accent = .*\n/m, "");
+assert.doesNotThrow(() => patchToml(noAccent, { ...base, accent: "violet" }));
+assert.throws(() => patchToml(noAccent, { ...base, accent: "red" }), /older than 0\.5\.0/);
+console.log("ok (accent)");
+
 // `npx` runs the program through a symlink: it must still start (0.1.0 and 0.2.0 silently did nothing then).
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, symlinkSync } from "node:fs";

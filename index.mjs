@@ -13,7 +13,9 @@ const REPO = "Vumlo/vumlo-core";
 
 // Each edit must hit exactly one line: a release that changed the example file fails loudly
 // instead of producing a config that quietly differs from what was asked.
-export function patchToml(text, { name, mode, origin, modules, short, domains = [], language, timeZone }) {
+export const ACCENTS = ["violet", "blue", "teal", "green", "orange", "red"];
+
+export function patchToml(text, { name, mode, origin, modules, short, accent, domains = [], language, timeZone }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`vumlo.toml: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -22,6 +24,12 @@ export function patchToml(text, { name, mode, origin, modules, short, domains = 
   set(/^mode = "university"$/m, `mode = "${mode}"`);
   set(/^public_origin = ".*"$/m, `public_origin = ${JSON.stringify(origin)}`);
   if (short) set(/^# short_name = ".*$/m, `short_name = ${JSON.stringify(short)}`);
+  if (accent && accent !== "violet") {
+    if (!/^# accent = ".*$/m.test(text)) {
+      throw new Error(`vumlo.toml: this release is older than 0.5.0 (its example has no "# accent" line), so the accent "${accent}" cannot be set. Use violet or a newer release.`);
+    }
+    set(/^# accent = ".*$/m, `accent = "${accent}"`);
+  }
   if (domains.length) set(/^allowed_domains = \[\].*$/m, `allowed_domains = ${JSON.stringify(domains)}`);
   if (language && language !== "en") set(/^# language = "en".*$/m, `language = ${JSON.stringify(language)}`);
   if (timeZone && timeZone !== "UTC") set(/^# time_zone = ".*$/m, `time_zone = ${JSON.stringify(timeZone)}`);
@@ -126,6 +134,7 @@ async function main() {
       mode: { type: "string" },
       origin: { type: "string" },
       "short-name": { type: "string" }, // the name in "Vumlo | <short name>"
+      accent: { type: "string" }, // violet | blue | teal | green | orange | red (needs a 0.5.0 release for anything but violet)
       domains: { type: "string" }, // comma separated email domains that may sign up themselves ("" for nobody)
       language: { type: "string" }, // en | uk
       "time-zone": { type: "string" }, // an IANA name, e.g. Europe/Kyiv
@@ -139,6 +148,7 @@ async function main() {
   const ask = async (given, fallback, prompt) => (given !== undefined ? given : quiet ? fallback : ok(await prompt()));
 
   p.intro("Vumlo installer");
+  if (f.accent !== undefined && !ACCENTS.includes(f.accent)) throw new Error(`accent must be one of ${ACCENTS.join(", ")}, not "${f.accent}"`);
 
   const dir = resolve(
     await ask(f.dir, "vumlo", () => p.text({ message: "Where to install?", placeholder: "vumlo", defaultValue: "vumlo" })),
@@ -157,6 +167,17 @@ async function main() {
     const found = existsSync(join(dir, "backend/crates/modules")) ? readdirSync(join(dir, "backend/crates/modules")) : [];
 
     const name = await ask(f.name, "Vumlo", () => p.text({ message: "Institution name", placeholder: "Example University", defaultValue: "Vumlo" }));
+    const short = await ask(f["short-name"], defaultShort(name), () =>
+      p.text({
+        message: "Short name (the apps are called Vumlo | <short name>)",
+        placeholder: defaultShort(name),
+        defaultValue: defaultShort(name),
+        validate: (v) => (v.length > 50 ? "50 characters at most" : undefined),
+      }),
+    );
+    const accent = await ask(f.accent, "violet", () =>
+      p.select({ message: "Accent colour", options: ACCENTS.map((value) => ({ value })), initialValue: "violet" }),
+    );
     const mode = await ask(f.mode, "university", () =>
       p.select({
         message: "School or university? (cannot be changed later)",
@@ -168,14 +189,6 @@ async function main() {
     );
     const origin = await ask(f.origin, "http://localhost:3000", () =>
       p.text({ message: "Public address (what people will type)", placeholder: "https://lms.example.edu", defaultValue: "http://localhost:3000" }),
-    );
-    const short = await ask(f["short-name"], defaultShort(name), () =>
-      p.text({
-        message: "Short name (the apps are called Vumlo | <short name>)",
-        placeholder: defaultShort(name),
-        defaultValue: defaultShort(name),
-        validate: (v) => (v.length > 50 ? "50 characters at most" : undefined),
-      }),
     );
     const domains = parseDomains(
       await ask(f.domains, "", () =>
@@ -202,20 +215,16 @@ async function main() {
       p.text({ message: "Time zone (deadlines are shown in it)", placeholder: detectedZone, defaultValue: detectedZone, validate: zoneError }),
     );
     if (zoneError(timeZone)) throw new Error(zoneError(timeZone));
-    const parts =
-      f.parts !== undefined || quiet
-        ? (f.parts ?? "web").split(",").filter(Boolean)
-        : ok(
-            await p.multiselect({
-              message: "What else besides the backend?",
-              options: [
-                { value: "web", label: "Web app", hint: "Next.js" },
-                { value: "desktop", label: "Desktop app", hint: "Tauri" },
-              ],
-              initialValues: ["web"],
-              required: false,
-            }),
-          );
+    // --parts web,desktop still answers both questions at once.
+    let parts = f.parts;
+    if (parts === undefined && !quiet) {
+      parts = [ok(await p.confirm({ message: "Web app (Next.js)?", initialValue: true })) && "web", ok(await p.confirm({ message: "Desktop app (Tauri)?", initialValue: false })) && "desktop"]
+        .filter(Boolean)
+        .join(",");
+    }
+    parts = (parts ?? "web").split(",").filter(Boolean);
+    for (const x of parts) if (!["web", "desktop"].includes(x)) throw new Error(`--parts takes web and desktop, not "${x}"`);
+    if (!found.length && f.modules === undefined && !quiet) p.log.info("This release has no optional modules.");
     const modules =
       f.modules !== undefined
         ? f.modules.split(",").filter(Boolean)
@@ -223,18 +232,19 @@ async function main() {
           ? ok(await p.multiselect({ message: "Modules", options: found.map((m) => ({ value: m })), required: false }))
           : [];
 
-    // Only what was picked stays on disk.
-    for (const part of ["web", "desktop"]) if (!parts.includes(part)) rmSync(join(dir, part), { recursive: true, force: true });
     for (const m of modules) {
       if (!found.includes(m)) throw new Error(`this release has no module "${m}"`);
     }
+    // Only what was picked stays on disk. The desktop app builds from web/, so web/ stays for either.
+    if (!parts.includes("web") && !parts.includes("desktop")) rmSync(join(dir, "web"), { recursive: true, force: true });
+    if (!parts.includes("desktop")) rmSync(join(dir, "desktop"), { recursive: true, force: true });
     if (!parts.includes("web")) {
       const compose = join(dir, "deploy/compose.yaml");
       writeFileSync(compose, dropWebService(readFileSync(compose, "utf8")));
     }
 
     const read = (rel) => readFileSync(join(dir, rel), "utf8");
-    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, modules, short, domains, language, timeZone }));
+    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, modules, short, accent, domains, language, timeZone }));
     writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules }));
     chmodSync(join(dir, ".env"), 0o600);
 
