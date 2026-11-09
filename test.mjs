@@ -46,7 +46,8 @@ console.log("ok (0.2.0)");
 
 // 0.3.0: the accent. The real example only has the line from release 0.5.0 on, so the text is built here.
 const base = { name: "X", mode: "school", origin: "http://localhost:3000", modules: [] };
-const withAccent = read("vumlo.example.toml").replace(/^# short_name = .*$/m, (l) => `${l}\n# accent = "violet"`);
+// (a core checkout that already has the line gets it once, not twice)
+const withAccent = read("vumlo.example.toml").replace(/^# accent = .*\n/m, "").replace(/^# short_name = .*$/m, (l) => `${l}\n# accent = "violet"`);
 assert.match(patchToml(withAccent, { ...base, accent: "teal" }), /^accent = "teal"$/m);
 assert.match(patchToml(withAccent, { ...base, accent: "violet" }), /^# accent = "violet"$/m);
 assert.match(patchToml(withAccent, base), /^# accent = "violet"$/m);
@@ -67,7 +68,7 @@ assert.match(run(["--archive", "/nonexistent.tar.gz", "--dir", join(tmpdir(), "c
 console.log("ok (symlink)");
 
 // 0.3.0: plugins, as written to plugins/compose.yaml.
-import { composeVersionOf, entriesToReplace, listPlugins, pluginCompose, versionOf } from "./index.mjs";
+import { addPluginEnv, composeVersionOf, describePlugin, entriesToReplace, listPlugins, pluginCompose, pluginLines, resolvePlugins, versionOf } from "./index.mjs";
 const pc = pluginCompose(["text-metrics", "ical-feed"]);
 assert.match(pc, /^services:\n {2}plugin-text-metrics:\n {4}build:\n {6}context: \.\.\/plugins\n {6}args:\n {8}PLUGIN: text-metrics$/m);
 assert.match(pc, /^ {2}plugin-ical-feed:$/m);
@@ -75,7 +76,27 @@ assert.match(pc, /VUMLO_API: http:\/\/core:8080$/m);
 assert.match(pc, /VUMLO_PLUGIN_TOKEN: \$\{PLUGIN_TEXT_METRICS_TOKEN:-\}$/m);
 assert.match(pc, /VUMLO_WEBHOOK_SECRET: \$\{PLUGIN_ICAL_FEED_SECRET:-\}$/m);
 assert.ok(!/ports:/.test(pc), "a plugin must not publish a port");
-assert.match(patchEnv("DATABASE_URL=x\nPOSTGRES_PASSWORD=y\n# VUMLO__PLUGINS__SECRET_KEY=\n", { password: "pw", modules: [], pluginKey: "k" }), /^VUMLO__PLUGINS__SECRET_KEY=k$/m);
+// .env: what is missing is added, what is there is never touched.
+const e1 = addPluginEnv("DATABASE_URL=x\n# VUMLO__PLUGINS__SECRET_KEY=\n", ["text-metrics"], "k1");
+assert.match(e1, /^VUMLO__PLUGINS__SECRET_KEY=k1$/m);
+assert.match(e1, /^PLUGIN_TEXT_METRICS_TOKEN=\nPLUGIN_TEXT_METRICS_SECRET=\n$/m);
+const e2 = addPluginEnv(e1.replace("TOKEN=", "TOKEN=tok").replace("k1", "mine"), ["text-metrics", "ical-feed"], "k2");
+assert.match(e2, /^VUMLO__PLUGINS__SECRET_KEY=mine$/m);
+assert.match(e2, /^PLUGIN_TEXT_METRICS_TOKEN=tok$/m);
+assert.equal(e2.match(/^PLUGIN_TEXT_METRICS_TOKEN=/gm).length, 1);
+assert.match(e2, /^PLUGIN_ICAL_FEED_TOKEN=\nPLUGIN_ICAL_FEED_SECRET=\n$/m);
+assert.equal(addPluginEnv(e2, ["ical-feed"], "k3"), e2);
+assert.match(addPluginEnv("A=1", [], "k"), /^A=1\nVUMLO__PLUGINS__SECRET_KEY=k\n$/);
+// The menu line of a plugin: the first prose line of its README.
+assert.equal(describePlugin("# Text metrics\n\n[![ci](x)](y)\n\nWord and **reading-time** counts for `text` fields.\n\nMore."), "Word and reading-time counts for text fields.");
+assert.equal(describePlugin("# Only a heading\n"), "");
+assert.equal(describePlugin(undefined), "");
+assert.equal(describePlugin(`# T\n\n${"word ".repeat(30)}`).length, 80);
+assert.ok(describePlugin(`# T\n\n${"word ".repeat(30)}`).endsWith("…"));
+assert.deepEqual(resolvePlugins("b, a,b", ["a", "b", "c"]), ["b", "a"]);
+assert.deepEqual(resolvePlugins("all", ["a", "b"]), ["a", "b"]);
+assert.throws(() => resolvePlugins("zz", ["a", "b"]), /no plugin "zz" \(it has: a, b\)/);
+assert.deepEqual(pluginLines([{ name: "a", description: "One" }, { name: "bcd", description: "" }], ["bcd"]), ["a    One", "bcd  (installed)"]);
 console.log("ok (plugins)");
 
 // 0.3.0: update helpers.
@@ -140,7 +161,9 @@ const release = (v) => {
 const pluginsRelease = () => {
   const root = join(work, "src-plugins");
   const top = join(root, "Vumlo-vumlo-plugins-abc123");
-  for (const n of ["text-metrics", "ical-feed"]) put(top, `${n}/app.py`, "app = 1\n");
+  for (const n of ["text-metrics", "ical-feed", "at-risk-students"]) put(top, `${n}/app.py`, "app = 1\n");
+  put(top, "text-metrics/README.md", "# text-metrics\n\nCounts words and reading time of text fields.\n");
+  put(top, "ical-feed/README.md", "# ical-feed\n\nA calendar feed of your deadlines.\n");
   put(top, "text-metrics/__pycache__/app.pyc", "x");
   put(top, "tests/test_x.py", "");
   for (const n of ["vumlo_plugins/__init__.py", "pyproject.toml", "uv.lock", "Dockerfile", "LICENSE"]) put(top, n, `${n}\n`);
@@ -162,7 +185,7 @@ const tree = (dir) => readdirSync(dir, { recursive: true });
 const scratchDirs = () => readdirSync(tmpdir()).filter((x) => x.startsWith("create-vumlo-")).sort();
 const scratchBefore = scratchDirs();
 const a = join(work, "a");
-let r = cli("--archive", v1, "--yes", "--dir", a, "--accent", "teal", "--parts", "desktop", "--modules", "ai_agent", "--plugins", "text-metrics", "--plugins-archive", pl);
+let r = cli("--archive", v1, "--yes", "--dir", a, "--accent", "teal", "--parts", "desktop", "--modules", "ai_agent", "--plugins", "text-metrics,ical-feed", "--plugins-archive", pl);
 assert.equal(r.code, 0, r.out);
 assert.ok(existsSync(join(a, "web/index.txt")) && existsSync(join(a, "desktop/index.txt")), "web/ must stay for the desktop app");
 assert.ok(!/^ {2}web:/m.test(text(a, "deploy/compose.yaml")), "the web service must be dropped");
@@ -173,10 +196,11 @@ assert.match(text(a, ".env"), /^VUMLO__PLUGINS__SECRET_KEY=.{40,}$/m);
 assert.match(text(a, ".env"), /^PLUGIN_TEXT_METRICS_TOKEN=$/m);
 assert.match(text(a, ".env"), /^PLUGIN_TEXT_METRICS_SECRET=$/m);
 assert.equal(statSync(join(a, ".env")).mode & 0o777, 0o600);
-assert.equal(text(a, "plugins/compose.yaml"), pluginCompose(["text-metrics"]));
-assert.deepEqual(listPlugins(join(a, "plugins")), ["text-metrics"]);
-for (const n of ["Dockerfile", "LICENSE", "pyproject.toml", "uv.lock", "vumlo_plugins/__init__.py", "text-metrics/app.py"]) assert.ok(existsSync(join(a, "plugins", n)), n);
-assert.ok(!existsSync(join(a, "plugins/ical-feed")) && !existsSync(join(a, "plugins/tests")) && !existsSync(join(a, "plugins/text-metrics/__pycache__")));
+assert.match(text(a, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=$/m);
+assert.equal(text(a, "plugins/compose.yaml"), pluginCompose(["ical-feed", "text-metrics"]));
+assert.deepEqual(listPlugins(join(a, "plugins")), ["ical-feed", "text-metrics"], "two plugins in one go");
+for (const n of ["Dockerfile", "LICENSE", "pyproject.toml", "uv.lock", "vumlo_plugins/__init__.py", "text-metrics/app.py", "ical-feed/app.py"]) assert.ok(existsSync(join(a, "plugins", n)), n);
+assert.ok(!existsSync(join(a, "plugins/at-risk-students")) && !existsSync(join(a, "plugins/tests")) && !existsSync(join(a, "plugins/text-metrics/__pycache__")));
 assert.ok(!tree(a).some((x) => x.split("/").includes(".vumlo")), "no .vumlo folder");
 assert.deepEqual(scratchDirs(), scratchBefore, "the scratch dir must be removed");
 
@@ -186,7 +210,17 @@ assert.notEqual(r.code, 0);
 assert.match(r.out, /accent must be one of violet, blue/);
 r = cli("--archive", v1, "--yes", "--dir", join(work, "bad"), "--plugins", "nope", "--plugins-archive", pl);
 assert.notEqual(r.code, 0);
-assert.match(r.out, /no plugin "nope" \(it has: ical-feed, text-metrics\)/);
+assert.match(r.out, /no plugin "nope" \(it has: at-risk-students, ical-feed, text-metrics\)/);
+
+// --list-plugins and `plugins list` print the plugins with their descriptions and install nothing.
+const lp = join(work, "listed");
+r = cli("--list-plugins", "--plugins-archive", pl, "--dir", lp);
+assert.equal(r.code, 0, r.out);
+assert.match(r.out, /Found 3 plugins/);
+assert.match(r.out, /ical-feed +A calendar feed of your deadlines\./);
+assert.match(r.out, /text-metrics +Counts words and reading time of text fields\./);
+assert.match(r.out, /at-risk-students/);
+assert.ok(!existsSync(lp) && !existsSync(join(work, "vumlo")), "--list-plugins installs nothing");
 assert.ok(!existsSync(join(work, "bad")));
 
 // Backend alone: neither web/ nor desktop/.
@@ -221,6 +255,38 @@ assert.match(listed, /^web\/index\.txt$/m);
 assert.ok(!/^(plugins|vumlo\.toml|\.env)/m.test(listed), "the backup holds only replaced files");
 assert.ok(!tree(a).some((x) => x.split("/").includes(".vumlo")));
 assert.match(cli("update", "--archive", v2, "--dir", a).out, /Already up to date \(0\.6\.0\)/);
+
+// `plugins list` marks the installed ones; `plugins add` adds a third without touching the first two or the .env values.
+r = cli("plugins", "list", "--dir", a, "--plugins-archive", pl);
+assert.match(r.out, /text-metrics .*\(installed\)/);
+assert.match(r.out, /at-risk-students/);
+assert.ok(!/at-risk-students.*\(installed\)/.test(r.out));
+const envBefore = text(a, ".env").replace("PLUGIN_TEXT_METRICS_TOKEN=", "PLUGIN_TEXT_METRICS_TOKEN=tok-1");
+writeFileSync(join(a, ".env"), envBefore);
+put(a, "plugins/ical-feed/mine.txt", "mine\n");
+put(a, "plugins/Dockerfile", "# edited by the administrator\n");
+assert.notEqual(cli("plugins", "add", "--dir", a, "--plugins-archive", pl).code, 0, "no names and no terminal");
+assert.match(cli("plugins", "add", "nope", "--dir", a, "--plugins-archive", pl).out, /no plugin "nope"/);
+assert.match(cli("plugins", "add", "x", "--dir", work, "--plugins-archive", pl).out, /has no vumlo\.toml/);
+r = cli("plugins", "add", "at-risk-students", "text-metrics", "--dir", a, "--plugins-archive", pl);
+assert.equal(r.code, 0, r.out);
+assert.match(r.out, /Already installed, left as they are: text-metrics/);
+assert.ok(existsSync(join(a, "plugins/at-risk-students/app.py")));
+assert.equal(text(a, "plugins/ical-feed/mine.txt"), "mine\n");
+assert.equal(text(a, "plugins/text-metrics/mine.txt"), "mine\n");
+assert.equal(text(a, "plugins/Dockerfile"), "# edited by the administrator\n");
+assert.equal(text(a, "plugins/compose.yaml"), pluginCompose(["at-risk-students", "ical-feed", "text-metrics"]));
+const envAfter = text(a, ".env");
+assert.ok(envAfter.startsWith(envBefore), "existing .env content is untouched, new lines come after it");
+assert.match(envAfter, /^PLUGIN_TEXT_METRICS_TOKEN=tok-1$/m);
+assert.match(envAfter, /^PLUGIN_AT_RISK_STUDENTS_TOKEN=\nPLUGIN_AT_RISK_STUDENTS_SECRET=\n$/m);
+assert.equal(statSync(join(a, ".env")).mode & 0o777, 0o600);
+assert.match(r.out, /plugin install http:\/\/plugin-at-risk-students:8000/);
+assert.ok(!/plugin install http:\/\/plugin-text-metrics/.test(r.out));
+assert.equal(cli("plugins", "add", "all", "--dir", a, "--plugins-archive", pl).code, 0);
+assert.equal(text(a, ".env"), envAfter, "adding what is there changes nothing");
+assert.equal(text(a, "vumlo.toml"), kept.toml);
+assert.deepEqual(scratchDirs(), scratchBefore, "the scratch dir must be removed");
 
 // An installation without web/ and desktop/ does not get them back.
 assert.equal(cli("update", "--archive", v2, "--dir", b).code, 0);

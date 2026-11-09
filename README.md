@@ -29,7 +29,7 @@ default):
 | Time zone | `--time-zone` | this computer's |
 | Web app? Desktop app? | `--parts web,desktop` (`""` for the backend alone) | web |
 | Modules of the release (only if it has any) | `--modules a,b` | none |
-| Plugins of the latest vumlo-plugins release | `--plugins a,b` (`""` for none) | none |
+| Plugins of the latest vumlo-plugins release | `--plugins a,b,c`, `--plugins all`, `--plugins ""` for none | none |
 
 An accent other than violet needs release 0.5.0 or newer; an older one stops with a message saying so.
 
@@ -40,6 +40,25 @@ The desktop app is built from `web/`, so `web/` stays when either is picked; onl
 dropped when the web app is not.
 
 ### Plugins
+
+The plugin question works like `npx skills add`: "Found N plugins", then a list where space toggles each one and every
+entry shows a one-line description (the first line of text in the plugin's `README.md`). You can pick several at once.
+
+```sh
+npx create-vumlo --list-plugins                  # print the plugins with their descriptions, install nothing
+npx create-vumlo --plugins a,b,c                 # several by name (an unknown name lists the available ones)
+npx create-vumlo --plugins all --yes             # every plugin, no questions
+npx create-vumlo plugins list [--dir .]          # inside an installation: the available ones, installed ones marked
+npx create-vumlo plugins add [name...] [--dir .] # add to an installation; no names on a terminal = the same list,
+                                                 # without those already in plugins/ ("all" adds every missing one)
+```
+
+`plugins add` uses the same code as the install and needs `vumlo.toml` in `--dir`. It copies only the new plugins (the
+ones already in `plugins/` stay as they are), rewrites `plugins/compose.yaml` to list every plugin now in the folder, and
+adds to `.env` only what is missing: the `PLUGIN_<NAME>_TOKEN`/`_SECRET` lines of the new plugins and
+`VUMLO__PLUGINS__SECRET_KEY` if there is none. Existing `.env` values are never changed, and the shared files
+(`Dockerfile`, `vumlo_plugins/`, ...) of `plugins/` are kept. The next steps it prints are those of the new plugins only.
+`--plugins-archive file.tar.gz` works for all of these.
 
 Plugins come from the latest release of [Vumlo/vumlo-plugins](https://github.com/Vumlo/vumlo-plugins), downloaded over
 HTTPS from GitHub. GitHub publishes no checksum for a release's source tarball, so unlike the core archive it is not
