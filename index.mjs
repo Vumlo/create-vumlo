@@ -185,6 +185,104 @@ const zoneError = (zone) => {
   }
 };
 
+// Top-level entries of an installation that an update never touches: what the administrator wrote or what
+// create-vumlo added. Anything the archive does not have is left alone too.
+const KEEP = ["vumlo.toml", ".env", "backups", "plugins"];
+
+// `version = "x"` under [workspace.package] of backend/Cargo.toml.
+export function versionOf(text) {
+  const section = text.split(/^\[workspace\.package\]\s*$/m)[1]?.split(/^\[/m)[0] ?? "";
+  return section.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+}
+
+// The default of ${VUMLO_VERSION:-x} in deploy/compose.yaml: the fallback when there is no backend/Cargo.toml.
+export function composeVersionOf(text) {
+  return text.match(/\$\{VUMLO_VERSION:-([^}]+)\}/)?.[1];
+}
+
+// The top-level entries of the archive to put into the installation. An installation that never had web/ or
+// desktop/ (they were not picked) does not get them now.
+export function entriesToReplace(archiveEntries, installEntries) {
+  const skip = new Set(KEEP);
+  for (const part of ["web", "desktop"]) if (!installEntries.includes(part)) skip.add(part);
+  return archiveEntries.filter((e) => !skip.has(e));
+}
+
+async function update(f) {
+  p.intro("Vumlo update");
+  const dir = resolve(f.dir ?? ".");
+  if (!existsSync(join(dir, "vumlo.toml"))) throw new Error(`${dir} has no vumlo.toml: run this inside a Vumlo installation (or pass --dir)`);
+  const read = (rel) => (existsSync(join(dir, rel)) ? readFileSync(join(dir, rel), "utf8") : "");
+  const old = versionOf(read("backend/Cargo.toml")) ?? composeVersionOf(read("deploy/compose.yaml"));
+  if (!old) {
+    if (!f.yes) throw new Error("cannot tell which version is installed (no backend/Cargo.toml or deploy/compose.yaml); run again with --yes to update anyway");
+    p.log.warn("The installed version is unknown; updating anyway.");
+  }
+
+  const s = p.spinner();
+  const stage = tempDir(); // the new release is unpacked here; removed below whatever happens
+  try {
+    s.start(f.archive ? "Unpacking" : "Downloading the release");
+    const rel = f.archive ? { tag: "local archive" } : await fetchRelease(f.version);
+    const fresh = join(stage, "release");
+    mkdirSync(fresh);
+    unpack(fresh, { file: f.archive && resolve(f.archive), bytes: rel.bytes });
+    const next = versionOf(existsSync(join(fresh, "backend/Cargo.toml")) ? readFileSync(join(fresh, "backend/Cargo.toml"), "utf8") : "") ?? rel.tag.replace(/^v/, "");
+    s.stop(`Unpacked ${next}`);
+    if (old && next === old) {
+      p.outro(`Already up to date (${old}).`);
+      return;
+    }
+
+    const entries = entriesToReplace(readdirSync(fresh), readdirSync(dir));
+    // A web service dropped at install time stays dropped.
+    const compose = read("deploy/compose.yaml");
+    if (entries.includes("deploy") && compose && !/^  web:/m.test(compose)) {
+      const file = join(fresh, "deploy/compose.yaml");
+      writeFileSync(file, dropWebService(readFileSync(file, "utf8")));
+    }
+
+    // Everything that is replaced is kept first, so local edits are never lost.
+    const had = entries.filter((e) => existsSync(join(dir, e)));
+    mkdirSync(join(dir, "backups"), { recursive: true });
+    let backup = join(dir, "backups", `vumlo-${old ?? "unknown"}-files.tar.gz`);
+    if (existsSync(backup)) backup = backup.replace(/\.tar\.gz$/, `-${Date.now()}.tar.gz`);
+    execFileSync("tar", ["-czf", backup, "-C", dir, ...had]);
+
+    s.start("Replacing the files");
+    try {
+      for (const e of entries) {
+        rmSync(join(dir, e), { recursive: true, force: true });
+        cpSync(join(fresh, e), join(dir, e), { recursive: true, verbatimSymlinks: true });
+      }
+    } catch (err) {
+      for (const e of entries) rmSync(join(dir, e), { recursive: true, force: true });
+      execFileSync("tar", ["-xzf", backup, "-C", dir]);
+      throw new Error(`${err.message}. The previous files are back (from ${backup}).`);
+    }
+    s.stop(`Replaced ${entries.join(", ")}`);
+
+    p.note(
+      [
+        `cd ${dir}`,
+        `# Read "Upgrade notes" in CHANGELOG.md (${old ?? "?"} -> ${next}).`,
+        "./vumlo config check && ./vumlo brand apply   # web/ was replaced, and the generated brand files lived there",
+        "deploy/update.sh --docker                     # backs up the database, stops the services, rebuilds, migrates, starts",
+        "",
+        `# Your own edits to the replaced files are in ${backup}`,
+        "# vumlo.toml, .env, backups/ and plugins/ were not touched.",
+      ].join("\n"),
+      "Next",
+    );
+    p.outro(`Updated ${old ?? "?"} -> ${next}. The services are still running the old version until update.sh has run.`);
+  } catch (e) {
+    s.stop("Failed");
+    throw e;
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const { values: f, positionals } = parseArgs({
     options: {
@@ -207,6 +305,7 @@ async function main() {
     },
     allowPositionals: true,
   });
+  if (positionals.length === 1 && positionals[0] === "update") return update(f);
   if (positionals.length) throw new Error(`unknown command "${positionals.join(" ")}" (there is only: update)`);
   // A flag wins; with --yes or no terminal the default is taken; otherwise ask.
   const quiet = f.yes || !process.stdin.isTTY;
