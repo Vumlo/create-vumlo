@@ -3,7 +3,8 @@
 // The result has the same layout as the repository (backend/, web/, desktop/, deploy/, ...).
 import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -40,7 +41,8 @@ export function patchToml(text, { name, mode, origin, modules, short, accent, do
   return text;
 }
 
-export function patchEnv(text, { password, modules }) {
+// pluginKey: the key every plugin's webhook secret is derived from; plugins cannot be installed without it.
+export function patchEnv(text, { password, modules, pluginKey }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`.env: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -48,8 +50,57 @@ export function patchEnv(text, { password, modules }) {
   set(/^DATABASE_URL=.*$/m, `DATABASE_URL=postgres://vumlo:${password}@postgres:5432/vumlo`);
   set(/^POSTGRES_PASSWORD=.*$/m, `POSTGRES_PASSWORD=${password}`);
   if (modules.length) set(/^# VUMLO_FEATURES=$/m, `VUMLO_FEATURES=${modules.join(",")}`);
+  if (pluginKey) set(/^# VUMLO__PLUGINS__SECRET_KEY=$/m, `VUMLO__PLUGINS__SECRET_KEY=${pluginKey}`);
   return text;
 }
+
+// A plugin is a folder of the plugins release; its name is also a compose service and a path, so it stays plain.
+const PLUGIN_NAME = /^[a-z0-9][a-z0-9-]*$/;
+const pluginVar = (name, what) => `PLUGIN_${name.toUpperCase().replaceAll("-", "_")}_${what}`;
+
+// plugins/compose.yaml, added to deploy/compose.yaml (`-f deploy/compose.yaml -f plugins/compose.yaml`; the ./vumlo
+// wrapper does it). Relative paths resolve from the first file's folder, deploy/, hence ../plugins. Nothing is
+// published: the core reaches a plugin by its service name, http://plugin-<name>:8000.
+export function pluginCompose(names) {
+  const service = (n) => `  plugin-${n}:
+    build:
+      context: ../plugins
+      args:
+        PLUGIN: ${n}
+    environment:
+      VUMLO_API: http://core:8080
+      VUMLO_PLUGIN_TOKEN: \${${pluginVar(n, "TOKEN")}:-}
+      VUMLO_WEBHOOK_SECRET: \${${pluginVar(n, "SECRET")}:-}
+    depends_on:
+      - core
+    restart: unless-stopped
+`;
+  return `# Written by create-vumlo. The token and secret of each plugin are in .env (see "Next" of the installer).\nservices:\n${names.map(service).join("\n")}`;
+}
+
+export function pluginEnv(names) {
+  return `\n# Plugins: \`./vumlo plugin install http://plugin-<name>:8000\` prints each token and secret.\n${names.map((n) => `${pluginVar(n, "TOKEN")}=\n${pluginVar(n, "SECRET")}=\n`).join("")}`;
+}
+
+// What a plugin needs next to its own folder to build (the Dockerfile of the plugins release).
+const PLUGIN_SHARED = ["vumlo_plugins", "pyproject.toml", "uv.lock", "Dockerfile", "LICENSE"];
+const PLUGINS_REPO = "Vumlo/vumlo-plugins";
+
+// The folders of the plugins release that hold a plugin (an app.py).
+export function listPlugins(dir) {
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && PLUGIN_NAME.test(d.name) && existsSync(join(dir, d.name, "app.py")))
+    .map((d) => d.name)
+    .sort();
+}
+
+// tar -xzf of a local file or of bytes into an existing folder, dropping the archive's top folder.
+function unpack(dest, { file, bytes }) {
+  execFileSync("tar", ["-xzf", file ?? "-", "-C", dest, "--strip-components=1"], bytes ? { input: bytes } : {});
+}
+
+// A new empty folder under the system temp dir, made by us and removed by the caller.
+const tempDir = () => mkdtempSync(join(tmpdir(), "create-vumlo-"));
 
 export function dropWebService(text) {
   const out = text.replace(/\n  # The browser-facing origin[\s\S]*?(?=\nvolumes:)/, "");
@@ -84,6 +135,16 @@ async function fetchRelease(version) {
   const got = createHash("sha256").update(bytes).digest("hex");
   if (want !== got) throw new Error(`checksum mismatch for ${archive.name}: do not use this download`);
   return { bytes, tag: rel.tag_name };
+}
+
+// The latest release of the plugins repository. GitHub publishes no checksum for a release's source tarball, so
+// unlike the core archive this one is trusted for HTTPS and the repository alone; plugins run in containers of their own.
+async function fetchPluginsRelease() {
+  const rel = await getJson(`https://api.github.com/repos/${PLUGINS_REPO}/releases/latest`).catch((e) => {
+    throw new Error(`cannot find a release of ${PLUGINS_REPO} (${e.message}); install without plugins (--plugins "") or try later`);
+  });
+  if (!rel.tarball_url) throw new Error(`release ${rel.tag_name} of ${PLUGINS_REPO} has no tarball`);
+  return { bytes: await getBuffer(rel.tarball_url), tag: rel.tag_name };
 }
 
 const ok = (v) => {
@@ -125,7 +186,7 @@ const zoneError = (zone) => {
 };
 
 async function main() {
-  const { values: f } = parseArgs({
+  const { values: f, positionals } = parseArgs({
     options: {
       dir: { type: "string" },
       version: { type: "string" },
@@ -140,9 +201,13 @@ async function main() {
       "time-zone": { type: "string" }, // an IANA name, e.g. Europe/Kyiv
       parts: { type: "string" }, // comma separated: web,desktop ("" for the backend alone)
       modules: { type: "string" }, // comma separated
+      plugins: { type: "string" }, // comma separated names from the latest vumlo-plugins release ("" for none)
+      "plugins-archive": { type: "string" }, // a local plugins tarball instead of the latest release (no checksum either way)
       yes: { type: "boolean", short: "y" },
     },
+    allowPositionals: true,
   });
+  if (positionals.length) throw new Error(`unknown command "${positionals.join(" ")}" (there is only: update)`);
   // A flag wins; with --yes or no terminal the default is taken; otherwise ask.
   const quiet = f.yes || !process.stdin.isTTY;
   const ask = async (given, fallback, prompt) => (given !== undefined ? given : quiet ? fallback : ok(await prompt()));
@@ -157,14 +222,25 @@ async function main() {
 
   const s = p.spinner();
   const created = !existsSync(dir);
+  const scratch = tempDir(); // the plugins release is unpacked here; removed below whatever happens
   try {
     s.start(f.archive ? "Unpacking" : "Downloading the latest release");
     const rel = f.archive ? { tag: "local archive" } : await fetchRelease(f.version);
     mkdirSync(dir, { recursive: true });
-    execFileSync("tar", ["-xzf", f.archive ? resolve(f.archive) : "-", "-C", dir, "--strip-components=1"], rel.bytes ? { input: rel.bytes } : {});
+    unpack(dir, { file: f.archive && resolve(f.archive), bytes: rel.bytes });
     s.stop(`Unpacked ${rel.tag}`);
 
     const found = existsSync(join(dir, "backend/crates/modules")) ? readdirSync(join(dir, "backend/crates/modules")) : [];
+    // The plugins release is only fetched when plugins can be chosen: named by --plugins, or asked for.
+    const wanted = f.plugins === undefined ? undefined : f.plugins.split(",").map((x) => x.trim()).filter(Boolean);
+    let available = [];
+    if (wanted ? wanted.length : !quiet) {
+      s.start(f["plugins-archive"] ? "Unpacking the plugins" : "Downloading the latest plugins release");
+      const prel = f["plugins-archive"] ? { tag: "local archive" } : await fetchPluginsRelease();
+      unpack(scratch, { file: f["plugins-archive"] && resolve(f["plugins-archive"]), bytes: prel.bytes });
+      available = listPlugins(scratch);
+      s.stop(`Plugins ${prel.tag}: ${available.join(", ") || "none"}`);
+    }
 
     const name = await ask(f.name, "Vumlo", () => p.text({ message: "Institution name", placeholder: "Example University", defaultValue: "Vumlo" }));
     const short = await ask(f["short-name"], defaultShort(name), () =>
@@ -235,6 +311,12 @@ async function main() {
     for (const m of modules) {
       if (!found.includes(m)) throw new Error(`this release has no module "${m}"`);
     }
+    const plugins =
+      wanted ??
+      (available.length && !quiet ? ok(await p.multiselect({ message: "Plugins", options: available.map((m) => ({ value: m })), required: false })) : []);
+    for (const n of plugins) {
+      if (!available.includes(n)) throw new Error(`the plugins release has no plugin "${n}" (it has: ${available.join(", ") || "none"})`);
+    }
     // Only what was picked stays on disk. The desktop app builds from web/, so web/ stays for either.
     if (!parts.includes("web") && !parts.includes("desktop")) rmSync(join(dir, "web"), { recursive: true, force: true });
     if (!parts.includes("desktop")) rmSync(join(dir, "desktop"), { recursive: true, force: true });
@@ -245,30 +327,53 @@ async function main() {
 
     const read = (rel) => readFileSync(join(dir, rel), "utf8");
     writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, modules, short, accent, domains, language, timeZone }));
-    writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules }));
+    const pluginKey = plugins.length ? randomBytes(32).toString("base64") : undefined;
+    writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules, pluginKey }) + (plugins.length ? pluginEnv(plugins) : ""));
     chmodSync(join(dir, ".env"), 0o600);
+
+    if (plugins.length) {
+      if (!existsSync(join(scratch, "Dockerfile"))) throw new Error("the plugins release has no Dockerfile");
+      const out = join(dir, "plugins");
+      mkdirSync(out);
+      const skip = (src) => !/(^|\/)(__pycache__|\.pytest_cache)(\/|$)/.test(src);
+      for (const n of [...plugins, ...PLUGIN_SHARED]) {
+        if (existsSync(join(scratch, n))) cpSync(join(scratch, n), join(out, n), { recursive: true, filter: skip });
+      }
+      writeFileSync(join(out, "compose.yaml"), pluginCompose(plugins));
+    }
 
     p.note(
       [
         `cd ${dir}`,
         "./vumlo config check && ./vumlo brand apply",
-        "export COMPOSE_FILE=deploy/compose.yaml COMPOSE_ENV_FILES=.env",
+        `export COMPOSE_FILE=deploy/compose.yaml${plugins.length ? ":plugins/compose.yaml" : ""} COMPOSE_ENV_FILES=.env`,
         "docker compose build",
         "docker compose up -d --wait postgres",
         "./vumlo db migrate",
         "./vumlo admin create you@example.edu --name Your --surname Name",
         "docker compose up -d && ./vumlo doctor",
+        ...(plugins.length
+          ? [
+              "",
+              "# Plugins: each one registers once the core is up (it needs VUMLO__PLUGINS__SECRET_KEY, which is set in .env).",
+              ...plugins.map((n) => `./vumlo plugin install http://plugin-${n}:8000   # prints a token and a secret`),
+              `# Put them in .env as ${plugins.map((n) => `${pluginVar(n, "TOKEN")} and ${pluginVar(n, "SECRET")}`).join("; ")}, then:`,
+              "docker compose up -d",
+            ]
+          : []),
         "",
         "# To look around first, after the migration: ./vumlo seed --demo",
-        "# The guide: docs/install.md (TLS, mail, upgrades, backups)",
+        "# Later: npx create-vumlo update (inside this folder); the guide is docs/install.md (TLS, mail, upgrades, backups)",
       ].join("\n"),
       "Next",
     );
-    p.outro(`Installed: backend${parts.map((x) => ` + ${x}`).join("")}${modules.map((m) => ` + ${m}`).join("")}. Secrets are in ${join(dir, ".env")}.`);
+    p.outro(`Installed: backend${parts.map((x) => ` + ${x}`).join("")}${modules.map((m) => ` + ${m}`).join("")}${plugins.map((n) => ` + plugin ${n}`).join("")}. Secrets are in ${join(dir, ".env")}.`);
   } catch (e) {
     s.stop("Failed");
     if (created) rmSync(dir, { recursive: true, force: true });
     throw e;
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 
