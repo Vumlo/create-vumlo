@@ -141,7 +141,7 @@ services:
 volumes:
   postgres-data:
 `;
-const release = (v) => {
+const release = (v, vumloScript = `#!/bin/sh\n# ${v}\n`) => {
   const root = join(work, `src-${v}`);
   const top = join(root, `vumlo-${v}`);
   put(top, "deploy/vumlo.example.toml", 'name = "Vumlo"\nmode = "university"\npublic_origin = "http://localhost:3000"\n# short_name = "UCU"\n# accent = "violet"\nallowed_domains = []\n# language = "en"\n# time_zone = "UTC"\ncookie_secure = false\n\n# [modules]\n# some-module = true\n');
@@ -152,7 +152,7 @@ const release = (v) => {
   put(top, "backend/crates/modules/ai_agent/Cargo.toml", "");
   put(top, "web/index.txt", `web ${v}\n`);
   put(top, "desktop/index.txt", `desktop ${v}\n`);
-  put(top, "vumlo", `#!/bin/sh\n# ${v}\n`, 0o755);
+  put(top, "vumlo", vumloScript, 0o755);
   put(top, "CHANGELOG.md", `# ${v}\n`);
   const file = join(root, `vumlo-${v}-source.tar.gz`);
   execFileSync("tar", ["-czf", file, "-C", root, `vumlo-${v}`]);
@@ -190,7 +190,11 @@ assert.equal(r.code, 0, r.out);
 assert.ok(existsSync(join(a, "web/index.txt")) && existsSync(join(a, "desktop/index.txt")), "web/ must stay for the desktop app");
 assert.ok(!/^ {2}web:/m.test(text(a, "deploy/compose.yaml")), "the web service must be dropped");
 assert.match(text(a, "vumlo.toml"), /^accent = "teal"$/m);
-assert.match(text(a, "vumlo.toml"), /^\[modules\]\nai_agent = true$/m);
+// The Buddy cannot start on `ai_agent = true` (config check wants an endpoint and a model): it gets its table, the defaults
+// when nothing was asked, and an empty key line to fill in later. Nothing else of the module is written.
+assert.match(text(a, "vumlo.toml"), /^\[modules\.ai_agent\]\nenabled = true\nendpoint = "https:\/\/api\.openai\.com\/v1"\nmodel = "gpt-4o-mini"$/m);
+assert.ok(!/^ai_agent = true$/m.test(text(a, "vumlo.toml")) && !/^daily_cap/m.test(text(a, "vumlo.toml")));
+assert.match(text(a, ".env"), /^VUMLO_AI_AGENT_API_KEY=$/m);
 assert.match(text(a, ".env"), /^VUMLO_FEATURES=ai_agent$/m);
 assert.match(text(a, ".env"), /^VUMLO__PLUGINS__SECRET_KEY=.{40,}$/m);
 assert.match(text(a, ".env"), /^PLUGIN_TEXT_METRICS_TOKEN=$/m);
@@ -203,6 +207,22 @@ for (const n of ["Dockerfile", "LICENSE", "pyproject.toml", "uv.lock", "vumlo_pl
 assert.ok(!existsSync(join(a, "plugins/at-risk-students")) && !existsSync(join(a, "plugins/tests")) && !existsSync(join(a, "plugins/text-metrics/__pycache__")));
 assert.ok(!tree(a).some((x) => x.split("/").includes(".vumlo")), "no .vumlo folder");
 assert.deepEqual(scratchDirs(), scratchBefore, "the scratch dir must be removed");
+
+// Flags and the environment answer the Buddy's questions; a module without settings stays `name = true`.
+{
+  const m = join(work, "buddy");
+  const x = spawnSync(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "--archive", v1, "--yes", "--dir", m, "--modules", "ai_agent", "--set", "ai_agent.endpoint=http://localhost:11434/v1", "--set", "ai_agent.model=llama3"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, VUMLO_AI_AGENT_API_KEY: "k-123" } });
+  assert.equal(x.status, 0, `${x.stdout}${x.stderr}`);
+  assert.match(text(m, "vumlo.toml"), /^endpoint = "http:\/\/localhost:11434\/v1"\nmodel = "llama3"$/m);
+  assert.match(text(m, ".env"), /^VUMLO_AI_AGENT_API_KEY=k-123$/m);
+  // A setting of a module that was not picked is refused: the questions exist only for the modules that are on.
+  const off = spawnSync(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, "--archive", v1, "--yes", "--dir", join(work, "buddy-off"), "--set", "ai_agent.model=x"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.notEqual(off.status, 0);
+  assert.match(`${off.stdout}${off.stderr}`, /--set ai_agent\.model: not a setting of a module you picked/);
+  assert.ok(!existsSync(join(work, "buddy-off")));
+  const cfg = patchToml(read("vumlo.example.toml"), { name: "X", mode: "school", origin: "http://localhost:3000", modules: ["vpl", "ai_agent"], settings: { ai_agent: { endpoint: "https://e", model: "m" } } });
+  assert.match(cfg, /^\[modules\]\nvpl = true\n\n\[modules\.ai_agent\]\nenabled = true\nendpoint = "https:\/\/e"\nmodel = "m"$/m);
+}
 
 // Wrong values are refused with a clear message, and nothing is left behind.
 r = cli("--archive", v1, "--yes", "--dir", join(work, "bad"), "--accent", "pink");
@@ -222,6 +242,128 @@ assert.match(r.out, /text-metrics +Counts words and reading time of text fields\
 assert.match(r.out, /at-risk-students/);
 assert.ok(!existsSync(lp) && !existsSync(join(work, "vumlo")), "--list-plugins installs nothing");
 assert.ok(!existsSync(join(work, "bad")));
+
+// --start: the whole sequence, with a fake docker and a fake ./vumlo that log what they were asked and print what the real
+// ones print. The order is the one of docs/install.md; the token and secret land in .env; no plugin shares a port.
+{
+  const bin = join(work, "bin");
+  const log = join(work, "calls.log");
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\nexit 0\n`, 0o755);
+  const fake = (v) => release(v, `#!/bin/sh
+echo "vumlo $*" >> "${log}"
+case "$*" in
+  "admin create"*) read -r pw; echo "pw=$pw" >> "${log}" ;;
+  "plugin install"*"--dry-run"*)
+    if [ -n "\${FAKE_BAD:-}" ] && [ "$3" = "http://plugin-\${FAKE_BAD}:8000" ]; then
+      echo "error: the manifest is not valid: route GET '/': the path needs at least one segment" >&2; exit 1
+    fi
+    echo "plugin x 1"; echo "  asks for scopes: read:courses, read:grades" ;;
+  "plugin install"*) printf 'installed\\n  VUMLO_PLUGIN_TOKEN=tok-%s\\n  VUMLO_WEBHOOK_SECRET=sec-%s\\n' "$3" "$3" ;;
+esac
+exit 0
+`);
+  const start = join(work, "start");
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, VUMLO_ADMIN_PASSWORD: "correct horse battery" };
+  const goWith = (extra, ...args) => {
+    const x = spawnSync(process.execPath, [new URL("./index.mjs", import.meta.url).pathname, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...env, ...extra } });
+    return { code: x.status, out: `${x.stdout}${x.stderr}` };
+  };
+  const go = (...args) => goWith({}, ...args);
+  r = go("--archive", fake("0.9.0"), "--yes", "--dir", start, "--start", "--grant-plugins", "--admin-email", "a@example.edu", "--plugins", "text-metrics,ical-feed", "--plugins-archive", pl);
+  assert.equal(r.code, 0, r.out);
+  const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
+  const at = (re) => calls.findIndex((c) => re.test(c));
+  const order = [/^vumlo config check/, /^vumlo brand apply/, /^docker compose build/, /^docker compose up -d --wait postgres/, /^vumlo db migrate/, /^vumlo admin create a@example.edu --name Admin --surname Admin --password-stdin/, /^docker compose up -d$/, /^vumlo doctor/, /^docker compose up -d --build plugin-ical-feed$/, /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant none.*--dry-run/, /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant read:courses,read:grades --courses all$/, /^docker compose up -d plugin-/];
+  let from = -1;
+  for (const re of order) {
+    const i = calls.findIndex((c, j) => j > from && re.test(c));
+    assert.ok(i > from, `${re} is missing or out of order in:\n${calls.join("\n")}`);
+    from = i;
+  }
+  assert.ok(at(/^pw=correct horse battery$/) > -1, "the password goes in on standard input, not as an argument");
+  assert.ok(!calls.some((c) => /correct horse/.test(c) && !c.startsWith("pw=")), "the password is never an argument");
+  assert.match(text(start, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=tok-http:\/\/plugin-ical-feed:8000$/m);
+  assert.match(text(start, ".env"), /^PLUGIN_TEXT_METRICS_SECRET=sec-http:\/\/plugin-text-metrics:8000$/m);
+  assert.match(r.out, /Vumlo is running/);
+  assert.ok(!/ports:/.test(text(start, "plugins/compose.yaml")), "every plugin listens on 8000 in a container of its own: nothing is published, so no port clashes");
+
+  // A plugin that does not build is left out: the install finishes, the others are registered, nothing waits for it.
+  rmSync(log, { force: true });
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\ncase "$*" in *--build\\ plugin-text-metrics) echo "pip failed" >&2; exit 1;; esac\nexit 0\n`, 0o755);
+  const skip = join(work, "start-skip");
+  r = go("--archive", fake("0.9.3"), "--yes", "--dir", skip, "--start", "--grant-plugins", "--plugins", "text-metrics,ical-feed", "--plugins-archive", pl);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /Not started, they are left out: text-metrics \(pip failed\)/);
+  const skipped = readFileSync(log, "utf8");
+  assert.ok(!/plugin install http:\/\/plugin-text-metrics/.test(skipped), "a plugin that did not start is not registered");
+  assert.match(text(skip, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=tok-/m);
+  assert.match(text(skip, ".env"), /^PLUGIN_TEXT_METRICS_TOKEN=$/m);
+
+  // A failing step keeps the files and says which step failed.
+  rmSync(log, { force: true });
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\ncase "$*" in "compose build") echo "boom" >&2; exit 3;; esac\nexit 0\n`, 0o755);
+  const kept2 = join(work, "start-fail");
+  r = go("--archive", fake("0.9.1"), "--yes", "--dir", kept2, "--start");
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /Building the images.*failed/s);
+  assert.match(r.out, /boom/);
+  assert.ok(existsSync(join(kept2, "vumlo.toml")) && existsSync(join(kept2, ".env")), "the files stay after a failed step");
+  assert.ok(!readFileSync(log, "utf8").includes("db migrate"), "nothing runs after the failed step");
+
+  // Without --start, and without a terminal, nothing is run.
+  rmSync(log, { force: true });
+  assert.equal(go("--archive", fake("0.9.2"), "--yes", "--dir", join(work, "nostart")).code, 0);
+  assert.deepEqual((existsSync(log) ? readFileSync(log, "utf8") : "").split("\n").filter((c) => c && c !== "docker compose version"), [], "no command runs without --start");
+
+  // One plugin whose manifest the core refuses (pdf-optimizer once declared `GET /`) does not stop the others: it is not
+  // waited for, the rest are registered and restarted, and the reason is shown at the end.
+  rmSync(log, { force: true });
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\nexit 0\n`, 0o755);
+  const mixed = join(work, "mixed");
+  const t0 = Date.now();
+  r = goWith({ FAKE_BAD: "ical-feed" }, "--archive", fake("0.9.4"), "--yes", "--dir", mixed, "--start", "--grant-plugins", "--plugins", "text-metrics,ical-feed,at-risk-students", "--plugins-archive", pl);
+  assert.equal(r.code, 0, r.out);
+  assert.ok(Date.now() - t0 < 20000, "a refused manifest is final: no waiting for it");
+  assert.match(r.out, /Not registered, they are left out: ical-feed \(error: the manifest is not valid: route GET '\/': the path needs at least one segment\)\. The others are running\./);
+  assert.match(text(mixed, ".env"), /^PLUGIN_TEXT_METRICS_TOKEN=tok-/m);
+  assert.match(text(mixed, ".env"), /^PLUGIN_AT_RISK_STUDENTS_TOKEN=tok-/m);
+  assert.match(text(mixed, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=$/m);
+  assert.ok(!readFileSync(log, "utf8").split("\n").some((c) => /plugin install http:\/\/plugin-ical-feed:8000 --grant read/.test(c)), "the refused plugin is not registered");
+  assert.match(r.out, /Vumlo is running/, "the run goes on to the end, with the administrator's note");
+
+  // `plugins register` takes the ones without a token (the fixed plugin, later) and only those.
+  rmSync(log, { force: true });
+  r = go("plugins", "register", "--dir", mixed, "--grant-plugins");
+  assert.equal(r.code, 0, r.out);
+  const again = readFileSync(log, "utf8").split("\n");
+  assert.ok(again.some((c) => /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant read:courses,read:grades --courses all$/.test(c)));
+  assert.ok(!again.some((c) => /--courses all/.test(c) && /plugin-(text-metrics|at-risk-students)/.test(c)), "registered plugins are left alone");
+  assert.match(text(mixed, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=tok-/m);
+  assert.match(go("plugins", "register", "--dir", mixed).out, /nothing to register/);
+  assert.match(go("plugins", "register", "nope", "--dir", mixed).out, /no plugin "nope"/);
+
+  // The plugins that were not granted are left for later, not registered.
+  rmSync(log, { force: true });
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\nexit 0\n`, 0o755);
+  r = go("--archive", fake("0.9.3"), "--yes", "--dir", join(work, "nograntt"), "--start", "--plugins", "text-metrics", "--plugins-archive", pl);
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!readFileSync(log, "utf8").split("\n").some((c) => /^vumlo plugin install .*--courses all/.test(c)), "no grant, no registration");
+  assert.match(r.out, /Not registered \(no grant given\): text-metrics/);
+}
+console.log("ok (--start)");
+
+// The pure helpers of --start.
+import { parseAsked, parseInstalled, setEnvVar, unregistered } from "./index.mjs";
+assert.deepEqual(unregistered(["a-b", "c", "d"], "PLUGIN_A_B_TOKEN=t\nPLUGIN_C_TOKEN=\n"), ["c", "d"], "an empty token or none at all is not registered");
+assert.equal(setEnvVar("A=1\nB=\nC=3\n", "B", "x=y/z"), "A=1\nB=x=y/z\nC=3\n");
+assert.equal(setEnvVar("A=1", "B", "2"), "A=1\nB=2\n");
+assert.equal(setEnvVar("A=1\n# B=old\n", "B", "2"), "A=1\n# B=old\nB=2\n", "a commented line is not the variable");
+assert.deepEqual(parseInstalled("installed x\nThese are shown once.\n  VUMLO_PLUGIN_TOKEN=t0k_en-1\n  VUMLO_WEBHOOK_SECRET=s3c=ret\n"), { token: "t0k_en-1", secret: "s3c=ret" });
+assert.throws(() => parseInstalled("nothing here"), /printed no token/);
+assert.deepEqual(parseAsked("plugin a 1\n  subscribes to: nothing\n  asks for scopes: read:courses, read:grades\n"), ["read:courses", "read:grades"]);
+assert.deepEqual(parseAsked("  asks for scopes: none\n"), []);
+assert.throws(() => parseAsked("error: unreachable"), /did not say/);
+console.log("ok (--start helpers)");
 
 // Backend alone: neither web/ nor desktop/.
 const b = join(work, "b");

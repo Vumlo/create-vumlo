@@ -2,7 +2,7 @@
 // create-vumlo: downloads a Vumlo release, keeps only the parts you pick, writes vumlo.toml and .env.
 // The result has the same layout as the repository (backend/, web/, desktop/, deploy/, ...).
 import { createHash, randomBytes } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,7 +16,23 @@ const REPO = "Vumlo/vumlo-core";
 // instead of producing a config that quietly differs from what was asked.
 export const ACCENTS = ["violet", "blue", "teal", "green", "orange", "red"];
 
-export function patchToml(text, { name, mode, origin, modules, short, accent, domains = [], language, timeZone }) {
+// Modules that cannot start on `name = true` alone (config check refuses them): the settings the installer asks for
+// (`fields`: a string each, with a default so a quiet run still passes config check) and, if the module has one, the
+// environment variable of its secret `key` (docs/install.md). It is asked about only when the module is picked. Every
+// other option of the module keeps its default and is edited in vumlo.toml later. A module not listed here needs nothing:
+// a new module with required settings is one more entry here.
+export const MODULE_SETTINGS = {
+  ai_agent: {
+    fields: [
+      { name: "endpoint", label: "endpoint (any OpenAI-compatible API)", default: "https://api.openai.com/v1" },
+      { name: "model", label: "model", default: "gpt-4o-mini" },
+    ],
+    key: "VUMLO_AI_AGENT_API_KEY",
+  },
+};
+
+// `settings`: { module: { endpoint, model } } for the modules that have them; they get a table of their own.
+export function patchToml(text, { name, mode, origin, modules, short, accent, domains = [], language, timeZone, settings = {} }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`vumlo.toml: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -36,12 +52,15 @@ export function patchToml(text, { name, mode, origin, modules, short, accent, do
   if (timeZone && timeZone !== "UTC") set(/^# time_zone = ".*$/m, `time_zone = ${JSON.stringify(timeZone)}`);
   if (origin.startsWith("https://")) set(/^cookie_secure = false.*$/m, "cookie_secure = true");
   if (modules.length) {
-    set(/^# \[modules\]\n# some-module = true$/m, `[modules]\n${modules.map((m) => `${m} = true`).join("\n")}`);
+    const plain = modules.filter((m) => !settings[m]);
+    const tables = modules.filter((m) => settings[m]).map((m) => [`[modules.${m}]`, "enabled = true", ...Object.entries(settings[m]).map(([k, v]) => `${k} = ${JSON.stringify(v)}`)].join("\n"));
+    set(/^# \[modules\]\n# some-module = true$/m, [plain.length && `[modules]\n${plain.map((m) => `${m} = true`).join("\n")}`, ...tables].filter(Boolean).join("\n\n"));
   }
   return text;
 }
 
-export function patchEnv(text, { password, modules }) {
+// `keys`: { VARIABLE: value } of the secrets of modules, written after the rest (empty: left to be filled in later).
+export function patchEnv(text, { password, modules, keys = {} }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`.env: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -49,7 +68,8 @@ export function patchEnv(text, { password, modules }) {
   set(/^DATABASE_URL=.*$/m, `DATABASE_URL=postgres://vumlo:${password}@postgres:5432/vumlo`);
   set(/^POSTGRES_PASSWORD=.*$/m, `POSTGRES_PASSWORD=${password}`);
   if (modules.length) set(/^# VUMLO_FEATURES=$/m, `VUMLO_FEATURES=${modules.join(",")}`);
-  return text;
+  const lines = Object.entries(keys).map(([name, value]) => `${name}=${value}\n`);
+  return lines.length ? `${text.replace(/\n*$/, "\n")}\n# Keys of the modules.\n${lines.join("")}` : text;
 }
 
 // A plugin is a folder of the plugins release; its name is also a compose service and a path, so it stays plain.
@@ -183,6 +203,163 @@ const pluginSteps = (names) => [
   `# Put them in .env as ${names.map((n) => `${pluginVar(n, "TOKEN")} and ${pluginVar(n, "SECRET")}`).join("; ")}, then:`,
   "docker compose up -d",
 ];
+
+// --- Bringing an installation up: what the "Next" note used to leave to the administrator ---------------------------
+
+// NAME=value in an .env text: the line is replaced, or added at the end when there is none.
+export function setEnvVar(text, name, value) {
+  const line = new RegExp(`^${name}=.*$`, "m");
+  return line.test(text) ? text.replace(line, () => `${name}=${value}`) : `${text.replace(/\n*$/, "\n")}${name}=${value}\n`;
+}
+
+// What `plugin install` prints, once: the token and the secret of the plugin.
+export function parseInstalled(out) {
+  const token = out.match(/^\s*VUMLO_PLUGIN_TOKEN=(\S+)\s*$/m)?.[1];
+  const secret = out.match(/^\s*VUMLO_WEBHOOK_SECRET=(\S+)\s*$/m)?.[1];
+  if (!token || !secret) throw new Error("`plugin install` printed no token and secret");
+  return { token, secret };
+}
+
+// The scopes a plugin asks for, from the "  asks for scopes: a, b" line of `plugin install` ("none": no scope).
+export function parseAsked(out) {
+  const list = out.match(/^\s*asks for scopes: (.*)$/m)?.[1];
+  if (list === undefined) throw new Error("`plugin install` did not say which scopes the plugin asks for");
+  return list.trim() === "none" ? [] : list.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+const hasDocker = () => spawnSync("docker", ["compose", "version"], { stdio: "ignore" }).status === 0;
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+// A command in the installation, with what ./vumlo sets for itself. `capture` returns its output (stdout and stderr) as
+// `out` instead of showing it; there is never a terminal on standard input, so `docker compose run` asks nothing.
+function runIn(dir, args, { input, capture, core } = {}) {
+  const env = {
+    ...process.env,
+    // `core`: only the core's services, so that a plugin which does not build cannot stop them.
+    COMPOSE_FILE: !core && existsSync(join(dir, "plugins/compose.yaml")) ? "deploy/compose.yaml:plugins/compose.yaml" : "deploy/compose.yaml",
+    COMPOSE_ENV_FILES: ".env",
+    VUMLO_UID: String(process.getuid?.() ?? 1000),
+    VUMLO_GID: String(process.getgid?.() ?? 1000),
+  };
+  const [cmd, ...rest] = args;
+  const r = spawnSync(cmd, rest, { cwd: dir, env, input, encoding: "utf8", stdio: [input === undefined ? "ignore" : "pipe", capture ? "pipe" : "inherit", capture ? "pipe" : "inherit"] });
+  return { status: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+
+// One labelled step; a failure stops everything, and the files stay where they are.
+function step(dir, label, args, opts) {
+  p.log.step(label);
+  const r = runIn(dir, args, opts);
+  if (r.status !== 0) throw new Error(`${label}: failed (${args.slice(0, 3).join(" ")} exited ${r.status}).${r.out ? `\n${r.out.trim()}` : ""}\nThe files are in ${dir}; fix the cause and run the failed command again, then the ones after it (docs/install.md).`);
+  return r.out;
+}
+
+// Builds and starts each plugin on its own. One that does not build or start is reported and left out; the others run.
+// Returns the names that are up. The files of a failed one stay, `plugins register` tries it again.
+function startPlugins(dir, names) {
+  const up = [];
+  const failed = [];
+  for (const n of names) {
+    p.log.step(`Building and starting the plugin ${n}`);
+    const r = runIn(dir, ["docker", "compose", "up", "-d", "--build", `plugin-${n}`], { capture: true });
+    if (r.status === 0) up.push(n);
+    else failed.push(`${n} (${r.out.trim().split("\n").at(-1) || `exited ${r.status}`})`);
+  }
+  if (failed.length) p.log.error(`Not started, they are left out: ${failed.join("; ")}. The others are running. Fix the cause, then: npx create-vumlo plugins register (inside ${dir}).`);
+  return up;
+}
+
+// Registers the plugins that are running with the core and keeps what it prints in .env, where the containers read it.
+// `consent`: true grants what each plugin asks for (all courses), false registers none, "ask" asks per plugin.
+// One plugin that cannot be registered does not stop the others: its reason is kept and shown at the end (a manifest the
+// core refuses is final and is not waited for; a plugin that does not answer is waited for ~30 s). Returns what happened.
+export async function registerPlugins(dir, names, consent) {
+  const registered = [];
+  const left = [];
+  const failed = [];
+  const reasonOf = (out) => out.match(/^error: .*$/m)?.[0] ?? out.trim().split("\n").at(-1) ?? "no answer";
+  for (const n of names) {
+    const url = `http://plugin-${n}:8000`;
+    // The manifest is read from the container, which may still be starting.
+    let asked;
+    let last = "";
+    for (let i = 0; i < 15 && !asked; i++) {
+      const r = runIn(dir, ["./vumlo", "plugin", "install", url, "--grant", "none", "--courses", "none", "--dry-run"], { capture: true });
+      if (r.status === 0) asked = parseAsked(r.out);
+      else {
+        last = r.out;
+        if (/the manifest is not valid/.test(r.out)) break;
+        await sleep(2000);
+      }
+    }
+    if (!asked) {
+      failed.push({ name: n, reason: reasonOf(last) });
+      continue;
+    }
+    const yes = consent === "ask" ? ok(await p.confirm({ message: `Plugin ${n} asks for: ${asked.join(", ") || "no scope"}. Grant it, for all courses?` })) : consent;
+    if (!yes) {
+      left.push(n);
+      continue;
+    }
+    p.log.step(`Registering the plugin ${n}`);
+    const r = runIn(dir, ["./vumlo", "plugin", "install", url, "--grant", asked.join(",") || "none", "--courses", "all"], { capture: true });
+    if (r.status !== 0) {
+      failed.push({ name: n, reason: reasonOf(r.out) });
+      continue;
+    }
+    const { token, secret } = parseInstalled(r.out);
+    const env = join(dir, ".env");
+    writeFileSync(env, setEnvVar(setEnvVar(readFileSync(env, "utf8"), pluginVar(n, "TOKEN"), token), pluginVar(n, "SECRET"), secret));
+    registered.push(n);
+  }
+  if (registered.length) step(dir, "Restarting the plugins with their tokens", ["docker", "compose", "up", "-d", ...registered.map((n) => `plugin-${n}`)]);
+  if (left.length) p.log.warn(`Not registered (no grant given): ${left.join(", ")}. Later: npx create-vumlo plugins register --grant-plugins (inside ${dir}), or one by one: ./vumlo plugin install http://plugin-<name>:8000 and the printed token and secret in .env.`);
+  if (failed.length) p.log.error(`Not registered, they are left out: ${failed.map((x) => `${x.name} (${x.reason})`).join("; ")}. The others are running.`);
+  return { registered, left, failed };
+}
+
+// The plugins in plugins/ that have no token in .env yet: not registered (a failed or declined run), whatever the reason.
+export function unregistered(names, envText) {
+  return names.filter((n) => !new RegExp(`^${pluginVar(n, "TOKEN")}=\\S`, "m").test(envText));
+}
+
+// `plugins register [name...]`: registers the plugins of an installation that have no token yet. Builds and starts them first.
+async function registerCmd(f, names, dir) {
+  p.intro("Vumlo plugins");
+  if (!existsSync(join(dir, "plugins/compose.yaml")) || !existsSync(join(dir, ".env"))) throw new Error(`${dir} has no plugins/compose.yaml and .env: run this inside an installation with plugins (or pass --dir)`);
+  if (!hasDocker()) throw new Error("registering needs Docker with the Compose plugin (docker compose)");
+  const have = listPlugins(join(dir, "plugins"));
+  for (const n of names) if (!have.includes(n)) throw new Error(`no plugin "${n}" in ${join(dir, "plugins")} (it has: ${have.join(", ") || "none"})`);
+  const todo = unregistered(names.length ? names : have, readFileSync(join(dir, ".env"), "utf8"));
+  if (!todo.length) {
+    p.outro("Every plugin already has a token: nothing to register.");
+    return;
+  }
+  const quiet = f.yes || !process.stdin.isTTY;
+  const { failed } = await registerPlugins(dir, startPlugins(dir, todo), f["grant-plugins"] ? true : quiet ? false : "ask");
+  p.outro(failed.length ? `Done, ${failed.length} plugin(s) could not be registered (above).` : "Done.");
+}
+
+// config check .. doctor, then the plugins: the steps of the old "Next" note, in order. The first failure stops with its output.
+async function bringUp(dir, { admin, plugins, consent }) {
+  // Captured, so the reason of a failure is in the error message and not only on the screen.
+  step(dir, "Checking vumlo.toml and .env", ["./vumlo", "config", "check"], { capture: true });
+  step(dir, "Writing the brand files", ["./vumlo", "brand", "apply"], { capture: true });
+  step(dir, "Building the images (the first build takes a while)", ["docker", "compose", "build"], { core: true });
+  step(dir, "Starting PostgreSQL", ["docker", "compose", "up", "-d", "--wait", "postgres"]);
+  step(dir, "Applying the migrations", ["./vumlo", "db", "migrate"]);
+  if (admin) step(dir, `Creating the administrator ${admin.email}`, ["./vumlo", "admin", "create", admin.email, "--name", admin.name, "--surname", admin.surname, "--password-stdin"], { input: `${admin.password}\n`, capture: true });
+  step(dir, "Starting the services", ["docker", "compose", "up", "-d"], { core: true });
+  p.log.step("Waiting for the core (vumlo doctor)");
+  let doctor;
+  for (let i = 0; i < 15; i++) {
+    doctor = runIn(dir, ["./vumlo", "doctor"], { capture: true });
+    if (doctor.status === 0) break;
+    await sleep(4000);
+  }
+  if (doctor.status !== 0) throw new Error(`vumlo doctor still fails:\n${doctor.out.trim()}\nThe files are in ${dir}; see docs/install.md.`);
+  if (plugins.length) await registerPlugins(dir, startPlugins(dir, plugins), consent);
+}
 
 export function dropWebService(text) {
   const out = text.replace(/\n  # The browser-facing origin[\s\S]*?(?=\nvolumes:)/, "");
@@ -403,6 +580,16 @@ async function pluginsCmd(f, sub, names, dir) {
       return;
     }
     addPlugins(dir, scratch, picked);
+    const quiet = f.yes || !process.stdin.isTTY;
+    const docker = hasDocker();
+    const start = f.start ?? (quiet || !docker ? false : ok(await p.confirm({ message: "Build, start and register them now?", initialValue: true })));
+    if (start && !docker) throw new Error("--start needs Docker with the Compose plugin (docker compose)");
+    if (start) {
+      const up = startPlugins(dir, picked);
+      await registerPlugins(dir, up, f["grant-plugins"] ? true : quiet ? false : "ask");
+      p.outro(up.length === picked.length ? `Added: ${picked.join(", ")}. They are running.` : `Added: ${picked.join(", ")}. Running: ${up.join(", ") || "none"}.`);
+      return;
+    }
     p.note(
       [
         `cd ${dir}`,
@@ -440,16 +627,23 @@ async function main() {
       plugins: { type: "string" }, // comma separated names from the latest vumlo-plugins release, "all", or "" for none
       "list-plugins": { type: "boolean" }, // print the plugins and their descriptions, install nothing
       "plugins-archive": { type: "string" }, // a local plugins tarball instead of the latest release (no checksum either way)
+      start: { type: "boolean" }, // after installing (or `plugins add`): build, migrate, create the administrator, start; needs Docker
+      "admin-email": { type: "string" }, // with --start: the first administrator (the password: VUMLO_ADMIN_PASSWORD, else one is generated)
+      "admin-name": { type: "string" },
+      "admin-surname": { type: "string" },
+      set: { type: "string", multiple: true }, // module.setting=value, e.g. ai_agent.model=gpt-4o-mini (a module's secret key comes from its environment variable)
+      "grant-plugins": { type: "boolean" }, // with --start: register each plugin with all it asks for, for all courses (without it: asked, or left for later)
       yes: { type: "boolean", short: "y" },
     },
     allowPositionals: true,
   });
   if (f["list-plugins"]) return pluginsCmd(f, "list", [], undefined);
   if (positionals.length === 1 && positionals[0] === "update") return update(f);
+  if (positionals[0] === "plugins" && positionals[1] === "register") return registerCmd(f, positionals.slice(2), resolve(f.dir ?? "."));
   if (positionals[0] === "plugins" && ["list", "add"].includes(positionals[1]) && (positionals[1] === "add" || positionals.length === 2)) {
     return pluginsCmd(f, positionals[1], positionals.slice(2), resolve(f.dir ?? "."));
   }
-  if (positionals.length) throw new Error(`unknown command "${positionals.join(" ")}" (there are: update, plugins list, plugins add [name...])`);
+  if (positionals.length) throw new Error(`unknown command "${positionals.join(" ")}" (there are: update, plugins list, plugins add [name...], plugins register [name...])`);
   // A flag wins; with --yes or no terminal the default is taken; otherwise ask.
   const quiet = f.yes || !process.stdin.isTTY;
   const ask = async (given, fallback, prompt) => (given !== undefined ? given : quiet ? fallback : ok(await prompt()));
@@ -465,6 +659,7 @@ async function main() {
   const s = p.spinner();
   const created = !existsSync(dir);
   const scratch = tempDir(); // the plugins release is unpacked here; removed below whatever happens
+  let setup; // set when the installation is to be started: run after the files are safely written
   try {
     s.start(f.archive ? "Unpacking" : "Downloading the latest release");
     const rel = f.archive ? { tag: "local archive" } : await fetchRelease(f.version);
@@ -482,7 +677,7 @@ async function main() {
         message: "Short name (the apps are called Vumlo | <short name>)",
         placeholder: defaultShort(name),
         defaultValue: defaultShort(name),
-        validate: (v) => (v.length > 50 ? "50 characters at most" : undefined),
+        validate: (v = "") => (v.length > 50 ? "50 characters at most" : undefined),
       }),
     );
     const accent = await ask(f.accent, "violet", () =>
@@ -508,7 +703,7 @@ async function main() {
           defaultValue: "",
           validate: (v) => {
             try {
-              parseDomains(v);
+              parseDomains(v ?? "");
             } catch (e) {
               return e.message;
             }
@@ -545,6 +740,26 @@ async function main() {
     for (const m of modules) {
       if (!found.includes(m)) throw new Error(`this release has no module "${m}"`);
     }
+    // What a module cannot start without. Quiet runs take the defaults, so config check passes; the key can come later.
+    const settings = {};
+    const keys = {};
+    const given = Object.fromEntries((f.set ?? []).map((x) => [x.slice(0, x.indexOf("=")), x.slice(x.indexOf("=") + 1)])); // --set module.field=value
+    for (const [name] of Object.entries(given)) {
+      const [m, field] = name.split(".");
+      if (!modules.includes(m) || !MODULE_SETTINGS[m]?.fields.some((x) => x.name === field)) throw new Error(`--set ${name}: not a setting of a module you picked`);
+    }
+    for (const m of modules.filter((x) => MODULE_SETTINGS[x])) {
+      const d = MODULE_SETTINGS[m];
+      p.log.info(`${m}: its other options keep their defaults; edit [modules.${m}] in vumlo.toml later.`);
+      settings[m] = {};
+      for (const x of d.fields) {
+        settings[m][x.name] = await ask(given[`${m}.${x.name}`], x.default, () => p.text({ message: `${m}: ${x.label}`, defaultValue: x.default, placeholder: x.default }));
+      }
+      if (d.key) {
+        keys[d.key] = process.env[d.key] ?? (quiet ? "" : ok(await p.password({ message: `${m}: secret key (empty: put ${d.key} in .env later)` })));
+        if (!keys[d.key]) p.log.warn(`${m} may answer nothing until ${d.key} is set in .env (then docker compose up -d).`);
+      }
+    }
     const plugins =
       f.plugins !== undefined
         ? resolvePlugins(f.plugins, available.map((x) => x.name))
@@ -552,6 +767,28 @@ async function main() {
           ? await chooseFrom(available)
           : [];
     if (!available.length && f.plugins === undefined && !quiet) p.log.info("The plugins release has no plugins.");
+
+    // Whether to go on and run it: the steps of docs/install.md, with the administrator asked for here.
+    const docker = hasDocker();
+    if (!docker && !quiet && f.start === undefined) p.log.info("Docker with Compose was not found: the installer only prepares the files.");
+    const start =
+      f.start ??
+      (quiet || !docker ? false : ok(await p.confirm({ message: "Build and start it now? (build, migrate, create the administrator, start, register the plugins)", initialValue: true })));
+    if (start && !docker) throw new Error("--start needs Docker with the Compose plugin (docker compose)");
+    let admin;
+    if (start) {
+      const email = await ask(f["admin-email"], "", () =>
+        p.text({ message: "Administrator email (empty: create it later)", defaultValue: "", validate: (v) => (v && !/^\S+@\S+\.\S+$/.test(v) ? "that is not an email address" : undefined) }),
+      );
+      if (email) {
+        const required = (v) => (v?.trim() ? undefined : "required");
+        const adminName = await ask(f["admin-name"], "Admin", () => p.text({ message: "Administrator first name", validate: required }));
+        const surname = await ask(f["admin-surname"], "Admin", () => p.text({ message: "Administrator last name", validate: required }));
+        const given = process.env.VUMLO_ADMIN_PASSWORD ?? (quiet ? "" : ok(await p.password({ message: "Administrator password (empty: generate one, shown once at the end)" })));
+        admin = { email, name: adminName, surname, password: given || randomBytes(12).toString("base64url"), generated: !given };
+      }
+    }
+    const consent = f["grant-plugins"] ? true : quiet ? false : "ask";
     // Only what was picked stays on disk. The desktop app builds from web/, so web/ stays for either.
     if (!parts.includes("web") && !parts.includes("desktop")) rmSync(join(dir, "web"), { recursive: true, force: true });
     if (!parts.includes("desktop")) rmSync(join(dir, "desktop"), { recursive: true, force: true });
@@ -561,35 +798,61 @@ async function main() {
     }
 
     const read = (rel) => readFileSync(join(dir, rel), "utf8");
-    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, modules, short, accent, domains, language, timeZone }));
-    writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules }));
+    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, modules, short, accent, domains, language, timeZone, settings }));
+    writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules, keys }));
     chmodSync(join(dir, ".env"), 0o600);
     if (plugins.length) addPlugins(dir, scratch, plugins);
 
-    p.note(
-      [
-        `cd ${dir}`,
-        "./vumlo config check && ./vumlo brand apply",
-        `export COMPOSE_FILE=deploy/compose.yaml${plugins.length ? ":plugins/compose.yaml" : ""} COMPOSE_ENV_FILES=.env`,
-        "docker compose build",
-        "docker compose up -d --wait postgres",
-        "./vumlo db migrate",
-        "./vumlo admin create you@example.edu --name Your --surname Name",
-        "docker compose up -d && ./vumlo doctor",
-        ...(plugins.length ? ["", "# Plugins: each registers once the core is up (VUMLO__PLUGINS__SECRET_KEY is set in .env).", ...pluginSteps(plugins)] : []),
-        "",
-        "# To look around first, after the migration: ./vumlo seed --demo",
-        "# Later: npx create-vumlo update (inside this folder); the guide is docs/install.md (TLS, mail, upgrades, backups)",
-      ].join("\n"),
-      "Next",
-    );
-    p.outro(`Installed: backend${parts.map((x) => ` + ${x}`).join("")}${modules.map((m) => ` + ${m}`).join("")}${plugins.map((n) => ` + plugin ${n}`).join("")}. Secrets are in ${join(dir, ".env")}.`);
+    const installed = `Installed: backend${parts.map((x) => ` + ${x}`).join("")}${modules.map((m) => ` + ${m}`).join("")}${plugins.map((n) => ` + plugin ${n}`).join("")}. Secrets are in ${join(dir, ".env")}.`;
+    if (start) {
+      p.log.success(installed);
+      setup = { dir, admin, plugins, consent, origin };
+    } else {
+      p.note(
+        [
+          `cd ${dir}`,
+          "./vumlo config check && ./vumlo brand apply",
+          `export COMPOSE_FILE=deploy/compose.yaml${plugins.length ? ":plugins/compose.yaml" : ""} COMPOSE_ENV_FILES=.env`,
+          "docker compose build",
+          "docker compose up -d --wait postgres",
+          "./vumlo db migrate",
+          "./vumlo admin create you@example.edu --name Your --surname Name",
+          "docker compose up -d && ./vumlo doctor",
+          ...(plugins.length ? ["", "# Plugins: each registers once the core is up (VUMLO__PLUGINS__SECRET_KEY is set in .env).", ...pluginSteps(plugins)] : []),
+          "",
+          "# To look around first, after the migration: ./vumlo seed --demo",
+          "# Later: npx create-vumlo update (inside this folder); the guide is docs/install.md (TLS, mail, upgrades, backups)",
+          "# All of this in one go: npx create-vumlo --start",
+        ].join("\n"),
+        "Next",
+      );
+      p.outro(installed);
+    }
   } catch (e) {
     s.stop("Failed");
     if (created) rmSync(dir, { recursive: true, force: true });
     throw e;
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+
+  // Outside the try above: a step that fails here must not remove the files that were just written.
+  if (setup) {
+    await bringUp(setup.dir, setup);
+    const { admin: a } = setup;
+    p.note(
+      [
+        `Open ${setup.origin}`,
+        ...(a ? [`Sign in as ${a.email}${a.generated ? `  with the password ${a.password}  (shown once: change it)` : ""}`] : ["No administrator yet: ./vumlo admin create you@example.edu --name Your --surname Name"]),
+        "",
+        `cd ${setup.dir}`,
+        "./vumlo seed --demo      # sample data, to look around",
+        "./vumlo doctor           # check the installation",
+        "npx create-vumlo update  # later, a newer release; the guide is docs/install.md (TLS, mail, upgrades, backups)",
+      ].join("\n"),
+      "Running",
+    );
+    p.outro("Vumlo is running.");
   }
 }
 
