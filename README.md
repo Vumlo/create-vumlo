@@ -72,6 +72,42 @@ published port; the core reaches it at `http://plugin-<name>:8000`). The `./vuml
 `./vumlo plugin install http://plugin-<name>:8000`, put the printed token and secret into those two variables, and run
 `docker compose up -d` again.
 
+## Modules that need settings
+
+A module that does not pass `config check` on `name = true` alone gets questions, and only when you pick it. The Buddy
+(`ai_agent`) asks for its endpoint (default `https://api.openai.com/v1`), model (default `gpt-4o-mini`) and API key
+(empty: fill in `VUMLO_AI_AGENT_API_KEY` in `.env` later) and is written as `[modules.ai_agent]`. Every other option
+(roles, daily limit, retention, notice) keeps its default and is edited in `vumlo.toml` afterwards. A module without
+required settings asks nothing. Without a terminal: `--set ai_agent.model=llama3` (repeatable; refused for a module you
+did not pick) and the key from the environment (`VUMLO_AI_AGENT_API_KEY`). A new module with required settings is one
+more entry in `MODULE_SETTINGS` in `index.mjs`.
+
+## Start it in one go
+
+With Docker installed, the installer ends with "Build and start it now?". Yes runs what `docs/install.md` lists, in
+order, and stops at the first failure with its output (the files stay): `config check`, `brand apply`, `docker compose
+build`, PostgreSQL, `db migrate`, the administrator, `docker compose up -d`, `doctor`, and each plugin registered with
+the core, its token and secret written to `.env`, then `docker compose up -d` again. It asks for the administrator's
+email, first name, last name and password (empty password: one is generated and shown once), and, per plugin, whether to
+grant the scopes it asks for (for all courses).
+
+Without a terminal nothing is started unless you say so:
+
+```sh
+VUMLO_ADMIN_PASSWORD=... npx create-vumlo --yes --start --admin-email you@example.edu --admin-name Your --admin-surname Name --grant-plugins
+```
+
+A plugin that cannot be built or started, or cannot be registered (the core refuses its manifest, or it does not answer),
+does not stop the others: it is
+left out, the reason is shown at the end, and the rest run. `npx create-vumlo plugins register [name...]` (inside the
+installation) later registers every plugin of `plugins/` that has no token in `.env` yet, after building and starting
+them: for a declined grant, a fixed plugin, or an interrupted run.
+
+`--grant-plugins` registers every chosen plugin with all it asks for, for all courses; without it (and no terminal) the
+plugins are left for later and the command to register each is printed. `plugins add` takes `--start` and
+`--grant-plugins` too. Every plugin listens on port 8000 inside a container of its own and publishes nothing, so
+several plugins never clash on a port.
+
 ## Update
 
 Inside an installation (a folder with `vumlo.toml`):
