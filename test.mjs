@@ -355,6 +355,39 @@ exit 0
   assert.equal(r.code, 0, r.out);
   assert.ok(!readFileSync(log, "utf8").split("\n").some((c) => /^vumlo plugin install .*--courses all/.test(c)), "no grant, no registration");
   assert.match(r.out, /Not registered \(no grant given\): text-metrics/);
+
+  // A retry starts over (ADR-0096): a failed run leaves nothing behind, a failed --start leaves a marker and the next run
+  // removes the folder with its containers and volumes, and a folder that is not an unfinished installation is never touched.
+  const marker = ".create-vumlo-unfinished";
+  const emptyDir = join(work, "retry-empty");
+  mkdirSync(emptyDir);
+  r = go("--archive", fake("0.9.5"), "--yes", "--dir", emptyDir, "--modules", "nope");
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /this release has no module "nope"/);
+  assert.deepEqual(readdirSync(emptyDir), [], "a failed run leaves an existing empty folder empty");
+  const foreign = join(work, "retry-foreign");
+  put(foreign, "keep.txt", "mine\n");
+  r = go("--archive", fake("0.9.5"), "--yes", "--dir", foreign);
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /is not empty/);
+  assert.ok(existsSync(join(foreign, "keep.txt")), "a folder without the marker is never wiped");
+  rmSync(log, { force: true });
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\ncase "$*" in "compose build") echo "boom" >&2; exit 3;; esac\nexit 0\n`, 0o755);
+  const again1 = join(work, "retry-start");
+  r = go("--archive", fake("0.9.5"), "--yes", "--dir", again1, "--start");
+  assert.notEqual(r.code, 0);
+  assert.ok(existsSync(join(again1, marker)), "a failed --start keeps the marker");
+  put(again1, "leftover.txt", "old\n");
+  rmSync(log, { force: true });
+  put(bin, "docker", `#!/bin/sh\necho "docker $*" >> "${log}"\nexit 0\n`, 0o755);
+  r = go("--archive", fake("0.9.5"), "--yes", "--dir", again1, "--start");
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!existsSync(join(again1, "leftover.txt")), "the unfinished installation was removed");
+  assert.ok(!existsSync(join(again1, marker)), "a finished installation has no marker");
+  const retryCalls = readFileSync(log, "utf8").split("\n");
+  const downAt = retryCalls.findIndex((c) => c === "docker compose -f deploy/compose.yaml down -v --remove-orphans");
+  assert.ok(downAt > -1 && downAt < retryCalls.findIndex((c) => c === "docker compose build"), "containers and volumes go before the reinstall");
+  assert.ok(!existsSync(join(work, "nostart", marker)), "no marker without --start either");
 }
 console.log("ok (--start)");
 

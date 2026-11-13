@@ -181,6 +181,15 @@ function unpack(dest, { file, bytes }) {
 // A new empty folder under the system temp dir, made by us and removed by the caller.
 const tempDir = () => mkdtempSync(join(tmpdir(), "create-vumlo-"));
 
+// Written into an installation as soon as it is unpacked and removed when the run is over: a folder that has it is an
+// unfinished installation of ours, the only kind a retry may remove (ADR-0096).
+export const UNFINISHED = ".create-vumlo-unfinished";
+
+// Everything inside `dir`, not `dir` itself.
+export function removeContents(dir) {
+  for (const e of readdirSync(dir)) rmSync(join(dir, e), { recursive: true, force: true });
+}
+
 // "a,b" -> ["a", "b"]; "all" -> every available plugin. A name the release lacks is an error that lists the ones it has.
 export function resolvePlugins(list, available) {
   const names = list.split(",").map((x) => x.trim()).filter(Boolean);
@@ -286,6 +295,20 @@ function step(dir, label, args, opts) {
   const r = runIn(dir, args, opts);
   if (r.status !== 0) throw new Error(`${label}: failed (${args.slice(0, 3).join(" ")} exited ${r.status}).${r.out ? `\n${r.out.trim()}` : ""}\nThe files are in ${dir}; fix the cause and run the failed command again, then the ones after it (docs/install.md).`);
   return r.out;
+}
+
+// An unfinished installation (it has the marker) is removed with its containers and volumes, so that the database password
+// of the new run cannot meet the volume of the old one. Docker being absent or failing is a warning: the files go anyway.
+async function startOver(dir, quiet) {
+  if (!quiet && !ok(await p.confirm({ message: `${dir} holds an unfinished installation. Remove it and start over?`, initialValue: true }))) {
+    throw new Error(`${dir} is left as it is.`);
+  }
+  if (existsSync(join(dir, "deploy/compose.yaml")) && hasDocker()) {
+    p.log.step("Removing the containers and volumes of the unfinished installation");
+    const r = runIn(dir, ["docker", "compose", "-f", "deploy/compose.yaml", "down", "-v", "--remove-orphans"], { capture: true });
+    if (r.status !== 0) p.log.warn(`docker compose down failed, the files are removed anyway:\n${r.out.trim()}`);
+  }
+  removeContents(dir);
 }
 
 // Builds and starts each plugin on its own. One that does not build or start is reported and left out; the others run.
@@ -711,7 +734,10 @@ async function main() {
   const dir = resolve(
     await ask(f.dir, "vumlo", () => p.text({ message: "Where to install?", placeholder: "vumlo", defaultValue: "vumlo" })),
   );
-  if (existsSync(dir) && readdirSync(dir).length) throw new Error(`${dir} is not empty.`);
+  if (existsSync(dir) && readdirSync(dir).length) {
+    if (!existsSync(join(dir, UNFINISHED))) throw new Error(`${dir} is not empty.`);
+    await startOver(dir, quiet);
+  }
 
   const s = p.spinner();
   const created = !existsSync(dir);
@@ -722,6 +748,7 @@ async function main() {
     const rel = f.archive ? { tag: "local archive" } : await fetchRelease(f.version);
     mkdirSync(dir, { recursive: true });
     unpack(dir, { file: f.archive && resolve(f.archive), bytes: rel.bytes });
+    writeFileSync(join(dir, UNFINISHED), "");
     s.stop(`Unpacked ${rel.tag}`);
 
     const found = existsSync(join(dir, "backend/crates/modules")) ? readdirSync(join(dir, "backend/crates/modules")) : [];
@@ -871,6 +898,7 @@ async function main() {
       p.log.success(installed);
       setup = { dir, admin, plugins, consent, origin, adminOrigin };
     } else {
+      rmSync(join(dir, UNFINISHED), { force: true });
       p.note(
         [
           `cd ${dir}`,
@@ -894,7 +922,9 @@ async function main() {
     }
   } catch (e) {
     s.stop("Failed");
+    // The folder was empty when the run began (or did not exist), so everything in it is this run's.
     if (created) rmSync(dir, { recursive: true, force: true });
+    else if (existsSync(dir)) removeContents(dir);
     throw e;
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -903,6 +933,7 @@ async function main() {
   // Outside the try above: a step that fails here must not remove the files that were just written.
   if (setup) {
     await bringUp(setup.dir, setup);
+    rmSync(join(setup.dir, UNFINISHED), { force: true });
     const { admin: a } = setup;
     p.note(
       [
