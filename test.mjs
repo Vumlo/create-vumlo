@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { defaultShort, dropWebService, guessDomain, parseDomains, patchEnv, patchToml } from "./index.mjs";
+import { adminOriginIn, checkAdminOrigin, defaultAdminOrigin, defaultShort, dropWebService, guessDomain, parseDomains, patchEnv, patchToml, withAdminOrigin } from "./index.mjs";
 
 // Run against the real example files of the sibling checkout: a release that changes them breaks this.
 const core = new URL("../vumlo-core/deploy/", import.meta.url);
@@ -107,6 +107,8 @@ const top = ["backend", "web", "desktop", "deploy", "vumlo", ".dockerignore", "v
 assert.deepEqual(entriesToReplace(top, ["backend", "web", "desktop", "vumlo.toml", ".env", "plugins", "backups"]), top);
 assert.deepEqual(entriesToReplace([...top, "plugins", "backups"], ["backend", "web", "vumlo.toml"]), ["backend", "web", "deploy", "vumlo", ".dockerignore", "vumlo.toml.example"]);
 assert.deepEqual(entriesToReplace(top, ["backend", "deploy"]), ["backend", "deploy", "vumlo", ".dockerignore", "vumlo.toml.example"]);
+assert.ok(entriesToReplace([...top, "web-admin"], ["backend", "web", "deploy"]).includes("web-admin"), "the admin console is replaced with the web app");
+assert.ok(!entriesToReplace([...top, "web-admin"], ["backend", "deploy"]).includes("web-admin"), "and not given to an installation without it");
 console.log("ok (update helpers)");
 
 // 0.3.0: the whole program against fixture archives (a fake release layout; no network).
@@ -141,16 +143,17 @@ services:
 volumes:
   postgres-data:
 `;
-const release = (v, vumloScript = `#!/bin/sh\n# ${v}\n`) => {
+const release = (v, vumloScript = `#!/bin/sh\n# ${v}\n`, withAdmin = false) => {
   const root = join(work, `src-${v}`);
   const top = join(root, `vumlo-${v}`);
-  put(top, "deploy/vumlo.example.toml", 'name = "Vumlo"\nmode = "university"\npublic_origin = "http://localhost:3000"\n# short_name = "UCU"\n# accent = "violet"\nallowed_domains = []\n# language = "en"\n# time_zone = "UTC"\ncookie_secure = false\n\n# [modules]\n# some-module = true\n');
+  put(top, "deploy/vumlo.example.toml", `name = "Vumlo"\nmode = "university"\npublic_origin = "http://localhost:3000"\n${withAdmin ? 'admin_origin = "http://localhost:3001"\n' : ""}# short_name = "UCU"\n# accent = "violet"\nallowed_domains = []\n# language = "en"\n# time_zone = "UTC"\ncookie_secure = false\n\n# [modules]\n# some-module = true\n`);
   put(top, "deploy/env.example", "DATABASE_URL=postgres://x\nPOSTGRES_PASSWORD=x\n# VUMLO_FEATURES=\n# VUMLO__PLUGINS__SECRET_KEY=\n");
   put(top, "deploy/compose.yaml", composeFixture(v));
   put(top, "deploy/update.sh", "#!/bin/sh\n", 0o755);
   put(top, "backend/Cargo.toml", `[workspace]\nmembers = []\n\n[workspace.package]\nversion = "${v}"\n`);
   put(top, "backend/crates/modules/ai_agent/Cargo.toml", "");
   put(top, "web/index.txt", `web ${v}\n`);
+  put(top, "web-admin/index.txt", `web-admin ${v}\n`);
   put(top, "desktop/index.txt", `desktop ${v}\n`);
   put(top, "vumlo", vumloScript, 0o755);
   put(top, "CHANGELOG.md", `# ${v}\n`);
@@ -189,6 +192,7 @@ let r = cli("--archive", v1, "--yes", "--dir", a, "--accent", "teal", "--parts",
 assert.equal(r.code, 0, r.out);
 assert.ok(existsSync(join(a, "web/index.txt")) && existsSync(join(a, "desktop/index.txt")), "web/ must stay for the desktop app");
 assert.ok(!/^ {2}web:/m.test(text(a, "deploy/compose.yaml")), "the web service must be dropped");
+assert.ok(!existsSync(join(a, "web-admin")), "the admin console is built with the web app: without it, not there either");
 assert.match(text(a, "vumlo.toml"), /^accent = "teal"$/m);
 // The Buddy cannot start on `ai_agent = true` (config check wants an endpoint and a model): it gets its table, the defaults
 // when nothing was asked, and an empty key line to fill in later. Nothing else of the module is written.
@@ -429,6 +433,53 @@ assert.equal(cli("plugins", "add", "all", "--dir", a, "--plugins-archive", pl).c
 assert.equal(text(a, ".env"), envAfter, "adding what is there changes nothing");
 assert.equal(text(a, "vumlo.toml"), kept.toml);
 assert.deepEqual(scratchDirs(), scratchBefore, "the scratch dir must be removed");
+
+// The address of the admin console (ADR-0095): derived from the public one, written into vumlo.toml, and asked for by an update.
+assert.equal(defaultAdminOrigin("http://localhost:3000"), "http://localhost:3001");
+assert.equal(defaultAdminOrigin("http://127.0.0.1:8080"), "http://127.0.0.1:8081");
+assert.equal(defaultAdminOrigin("https://lms.example.edu"), "https://admin.lms.example.edu");
+assert.equal(defaultAdminOrigin("https://lms.example.edu:8443"), "https://admin.lms.example.edu:8443");
+assert.doesNotThrow(() => checkAdminOrigin("https://admin.a.edu", "https://a.edu"));
+assert.throws(() => checkAdminOrigin("https://a.edu", "https://a.edu"), /differ/);
+assert.throws(() => checkAdminOrigin("admin.a.edu", "https://a.edu"), /scheme/);
+assert.throws(() => checkAdminOrigin("https://admin.a.edu/x", "https://a.edu"), /path/);
+{
+  const example = read("vumlo.example.toml");
+  assert.match(patchToml(example, { name: "X", mode: "school", origin: "https://lms.example.edu", modules: [] }), /^admin_origin = "https:\/\/admin\.lms\.example\.edu"$/m, "derived when not given");
+  assert.match(patchToml(example, { name: "X", mode: "school", origin: "https://lms.example.edu", adminOrigin: "https://console.example.edu", modules: [] }), /^admin_origin = "https:\/\/console\.example\.edu"$/m);
+  // An example of an older release has no such line: nothing is written and nothing breaks.
+  const older = example.replace(/^admin_origin = .*\n/m, "");
+  assert.doesNotThrow(() => patchToml(older, { name: "X", mode: "school", origin: "https://lms.example.edu", modules: [] }));
+  assert.ok(!/^admin_origin/m.test(patchToml(older, { name: "X", mode: "school", origin: "https://lms.example.edu", modules: [] })));
+}
+assert.equal(adminOriginIn('[server]\npublic_origin = "https://a.edu"\nadmin_origin = "https://admin.a.edu"\n'), "https://admin.a.edu");
+assert.equal(adminOriginIn('[server]\npublic_origin = "https://a.edu"\n# admin_origin = "x"\n'), undefined);
+assert.equal(withAdminOrigin('[server]\npublic_origin = "https://a.edu"\nbind_addr = "x"\n', "https://admin.a.edu"), '[server]\npublic_origin = "https://a.edu"\nadmin_origin = "https://admin.a.edu"\nbind_addr = "x"\n');
+assert.throws(() => withAdminOrigin("[server]\n", "https://admin.a.edu"), /public_origin/);
+
+// An update to a release that needs the key: never written without an answer, written with one.
+{
+  const v3 = release("0.7.0", undefined, true);
+  const old = join(work, "needs-admin-origin");
+  assert.equal(cli("--archive", v1, "--yes", "--dir", old, "--origin", "https://lms.example.edu").code, 0);
+  assert.ok(!/^admin_origin/m.test(text(old, "vumlo.toml")), "a release before 0.7.0 writes none");
+  const silent = cli("update", "--archive", v3, "--dir", old, "--yes");
+  assert.equal(silent.code, 0, silent.out);
+  assert.ok(!/^admin_origin/m.test(text(old, "vumlo.toml")), "no answer: nothing is written");
+  assert.match(silent.out, /admin_origin/, "and the note says it is missing");
+  const bad = cli("update", "--archive", release("0.7.1", undefined, true), "--dir", old, "--yes", "--admin-origin", "https://lms.example.edu");
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.out, /differ/);
+  assert.ok(!/^admin_origin/m.test(text(old, "vumlo.toml")));
+  const answered = cli("update", "--archive", release("0.7.2", undefined, true), "--dir", old, "--yes", "--admin-origin", "https://admin.lms.example.edu");
+  assert.equal(answered.code, 0, answered.out);
+  assert.match(text(old, "vumlo.toml"), /^public_origin = "https:\/\/lms\.example\.edu"\nadmin_origin = "https:\/\/admin\.lms\.example\.edu"$/m);
+  assert.match(answered.out, /admin\.lms\.example\.edu/);
+  // Once there, an update leaves it alone.
+  const again = cli("update", "--archive", release("0.7.3", undefined, true), "--dir", old, "--yes", "--admin-origin", "https://other.example.edu");
+  assert.equal(again.code, 0, again.out);
+  assert.match(text(old, "vumlo.toml"), /^admin_origin = "https:\/\/admin\.lms\.example\.edu"$/m);
+}
 
 // An installation without web/ and desktop/ does not get them back.
 assert.equal(cli("update", "--archive", v2, "--dir", b).code, 0);

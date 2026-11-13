@@ -24,6 +24,7 @@ default):
 | Accent colour: violet, blue, teal, green, orange, red | `--accent` | `violet` |
 | School or university (cannot be changed later) | `--mode` | `university` |
 | Public address | `--origin` | `http://localhost:3000` |
+| Admin console address | `--admin-origin` | `http://localhost:3001`; with a domain, `admin.` before its host |
 | Email domains that may sign up | `--domains` | nobody |
 | Language of the web app | `--language` | `en` |
 | Time zone | `--time-zone` | this computer's |
@@ -113,7 +114,7 @@ several plugins never clash on a port.
 Inside an installation (a folder with `vumlo.toml`):
 
 ```sh
-npx create-vumlo update [--dir .] [--version 0.6.0] [--archive file.tar.gz] [--yes]
+npx create-vumlo update [--dir .] [--version 0.6.0] [--archive file.tar.gz] [--admin-origin https://admin.lms.example.edu] [--yes]
 ```
 
 It reads the installed version from `backend/Cargo.toml` (or the default of `VUMLO_VERSION` in `deploy/compose.yaml`;
@@ -125,6 +126,8 @@ backup back.
 Never touched: `vumlo.toml`, `.env`, `backups/`, `plugins/`, and anything the release does not contain. `web/` and
 `desktop/` are not brought back where the installation never had them, and a Compose file whose web service was
 dropped stays so.
+
+A release from 0.7.0 on needs `server.admin_origin` in `vumlo.toml`, the address of the admin console. If the installation has none, `update` asks for it once (`--admin-origin` answers it; it must differ from `public_origin`) and writes it under `public_origin`. With `--yes` and no `--admin-origin` it writes nothing and the closing note says to add it, because the new release does not start without it.
 
 It does not restart anything. Read the Upgrade notes in `CHANGELOG.md`, run `./vumlo config check && ./vumlo brand apply`
 (`web/` was replaced, and the generated brand files live in it), then `deploy/update.sh --docker`, which backs up the
