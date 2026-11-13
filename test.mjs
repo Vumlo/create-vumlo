@@ -116,6 +116,8 @@ import { createServer as netServer } from "node:net";
 import { createServer as httpServer } from "node:http";
 import tlsLib from "node:tls";
 import { checkS3, checkSmtp, signV4 } from "./checks.mjs";
+let pems; // a throwaway certificate (null without openssl) and a scripted SMTP server, shared with the install tests below
+let fakeSmtp;
 {
   // The documented SigV4 example "GET Object" (AWS docs, Signature Version 4, header-based authentication).
   const signed = signV4({
@@ -127,7 +129,7 @@ import { checkS3, checkSmtp, signV4 } from "./checks.mjs";
   assert.match(signed.authorization, /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20130524\/us-east-1\/s3\/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, /);
 
   // A scripted SMTP server: PLAIN and LOGIN with one right password, STARTTLS when it has a certificate.
-  const pems = (() => {
+  pems = (() => {
     try {
       const dir = mkdtempSync(join(tmpdir(), "create-vumlo-cert-"));
       execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", join(dir, "k.pem"), "-out", join(dir, "c.pem"), "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"], { stdio: "ignore" });
@@ -136,7 +138,7 @@ import { checkS3, checkSmtp, signV4 } from "./checks.mjs";
       return null;
     }
   })();
-  const fakeSmtp = async ({ password = "right", certs, implicit = false, silent = false, caps = "AUTH PLAIN LOGIN" } = {}) => {
+  fakeSmtp = async ({ password = "right", certs, implicit = false, silent = false, caps = "AUTH PLAIN LOGIN" } = {}) => {
     const serve = (sock) => {
       let buf = "";
       let step = "";
@@ -313,7 +315,7 @@ console.log("ok (update helpers)");
 
 // 0.3.0: the whole program against fixture archives (a fake release layout; no network).
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 const work = mkdtempSync(join(tmpdir(), "create-vumlo-test-"));
 const put = (root, rel, text, mode) => {
   mkdirSync(join(root, rel, ".."), { recursive: true });
@@ -346,8 +348,8 @@ volumes:
 const release = (v, vumloScript = `#!/bin/sh\n# ${v}\n`, withAdmin = false) => {
   const root = join(work, `src-${v}`);
   const top = join(root, `vumlo-${v}`);
-  put(top, "deploy/vumlo.example.toml", `name = "Vumlo"\nmode = "university"\npublic_origin = "http://localhost:3000"\n${withAdmin ? 'admin_origin = "http://localhost:3001"\n' : ""}# short_name = "UCU"\n# accent = "violet"\nallowed_domains = []\n# language = "en"\n# time_zone = "UTC"\ncookie_secure = false\n\n# [modules]\n# some-module = true\n`);
-  put(top, "deploy/env.example", "DATABASE_URL=postgres://x\nPOSTGRES_PASSWORD=x\n# VUMLO_FEATURES=\n# VUMLO__PLUGINS__SECRET_KEY=\n");
+  put(top, "deploy/vumlo.example.toml", `name = "Vumlo"\nmode = "university"\npublic_origin = "http://localhost:3000"\n${withAdmin ? 'admin_origin = "http://localhost:3001"\n' : ""}# short_name = "UCU"\n# accent = "violet"\nallowed_domains = []\n# language = "en"\n# time_zone = "UTC"\ncookie_secure = false\n# client_ip_header = "x-real-ip"\n\n# [mail]\n# from = "Vumlo <no-reply@example.edu>"\n# [mail.transport]\n# kind = "smtp"\n# host = "smtp.example.edu"\n# port = 587\n# tls = "starttls"\n# username = "vumlo"\n\n[files]\nstorage = "local"\n# [files.s3]\n# endpoint = "https://s3.example.edu"\n# bucket = "vumlo-files"\n# region = "eu-north-1"\n\n# [modules]\n# some-module = true\n`);
+  put(top, "deploy/env.example", "DATABASE_URL=postgres://x\nPOSTGRES_PASSWORD=x\n# VUMLO_FEATURES=\n# VUMLO__MAIL__TRANSPORT__PASSWORD=\n# VUMLO__PLUGINS__SECRET_KEY=\n");
   put(top, "deploy/compose.yaml", composeFixture(v));
   put(top, "deploy/update.sh", "#!/bin/sh\n", 0o755);
   put(top, "backend/Cargo.toml", `[workspace]\nmembers = []\n\n[workspace.package]\nversion = "${v}"\n`);
@@ -723,5 +725,83 @@ assert.ok(!/^ {2}web:/m.test(text(b, "deploy/compose.yaml")));
 rmSync(join(b, "backend/Cargo.toml"));
 rmSync(join(b, "deploy/compose.yaml"));
 assert.match(cli("update", "--archive", v1, "--dir", b).out, /cannot tell which version/);
+// ADR-0096: the questions, the checks and the proxy files, through the installer itself. A real child process: the fake
+// server must keep answering while it runs, so not spawnSync.
+{
+  const indexPath = new URL("./index.mjs", import.meta.url).pathname;
+  const go = (args, env = {}) =>
+    new Promise((done) => {
+      const c = spawn(process.execPath, [indexPath, ...args], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      c.stdout.on("data", (d) => (out += d));
+      c.stderr.on("data", (d) => (out += d));
+      c.on("close", (code) => done({ code, out }));
+    });
+  const rel = release("0.9.7", undefined, true);
+  const base = ["--archive", rel, "--yes"];
+  const SECRET = "pw-9X-secret";
+
+  // Mail: asked by flags, checked against the server, written to vumlo.toml and .env; the password only to .env.
+  let smtp = await fakeSmtp({ password: SECRET });
+  const mailArgs = (port) => ["--mail", "yes", "--mail-host", "127.0.0.1", "--mail-port", String(port), "--mail-tls", "none", "--mail-user", "u"];
+  const m1 = join(work, "wire-mail");
+  r = await go([...base, "--dir", m1, ...mailArgs(smtp.port)], { VUMLO__MAIL__TRANSPORT__PASSWORD: SECRET });
+  assert.equal(r.code, 0, r.out);
+  assert.match(text(m1, "vumlo.toml"), /^\[mail\.transport\]\nkind = "smtp"\nhost = "127\.0\.0\.1"\nport = \d+\ntls = "none"\nusername = "u"$/m);
+  assert.match(text(m1, ".env"), new RegExp(`^VUMLO__MAIL__TRANSPORT__PASSWORD='${SECRET}'$`, "m"));
+  assert.ok(!text(m1, "vumlo.toml").includes(SECRET) && !r.out.includes(SECRET), "the password is only in .env");
+  assert.ok(!existsSync(join(m1, ".create-vumlo-unfinished")));
+  // A wrong password stops before any file is written, and the folder the run made is gone.
+  const m2 = join(work, "wire-mail-wrong");
+  r = await go([...base, "--dir", m2, ...mailArgs(smtp.port)], { VUMLO__MAIL__TRANSPORT__PASSWORD: "wrong-one" });
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /refused the login: 535 5\.7\.8 authentication failed/);
+  assert.ok(!r.out.includes("wrong-one"));
+  assert.ok(!existsSync(m2), "nothing is left after a failed check");
+  smtp.close();
+  // A host the installer's machine cannot reach: --skip-checks writes it all the same.
+  const m3 = join(work, "wire-mail-skip");
+  r = await go([...base, "--dir", m3, ...mailArgs(1), "--skip-checks"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(text(m3, "vumlo.toml"), /^host = "127\.0\.0\.1"$/m);
+  assert.match(text(m3, ".env"), /^# VUMLO__MAIL__TRANSPORT__PASSWORD=$/m, "no password given, the example's line stays");
+  // Without --skip-checks the same host fails.
+  r = await go([...base, "--dir", join(work, "wire-mail-down"), ...mailArgs(1)]);
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /cannot connect to 127\.0\.0\.1:1/);
+
+  // S3: written with the keys in .env only; an unreachable endpoint fails the check.
+  const s3 = join(work, "wire-s3");
+  const s3Args = ["--files", "s3", "--s3-bucket", "vumlo-files", "--s3-endpoint", "https://s3.example.edu"];
+  const keys = { VUMLO__FILES__S3__ACCESS_KEY: "AKEY", VUMLO__FILES__S3__SECRET_KEY: "SKEY/with+chars" };
+  r = await go([...base, "--dir", s3, ...s3Args, "--skip-checks"], keys);
+  assert.equal(r.code, 0, r.out);
+  assert.match(text(s3, "vumlo.toml"), /^storage = "s3"$/m);
+  assert.match(text(s3, "vumlo.toml"), /^\[files\.s3\]\nendpoint = "https:\/\/s3\.example\.edu"\nbucket = "vumlo-files"\nregion = "eu-north-1"$/m);
+  assert.match(text(s3, ".env"), /^VUMLO__FILES__S3__SECRET_KEY='SKEY\/with\+chars'$/m);
+  assert.ok(!text(s3, "vumlo.toml").includes("SKEY") && !r.out.includes("SKEY"));
+  const s3down = join(work, "wire-s3-down");
+  r = await go([...base, "--dir", s3down, "--files", "s3", "--s3-bucket", "b", "--s3-endpoint", "https://127.0.0.1:1"], keys);
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /cannot reach 127\.0\.0\.1:1/);
+  assert.ok(!existsSync(s3down));
+  r = await go([...base, "--dir", join(work, "wire-s3-nokeys"), "--files", "s3", "--s3-bucket", "b"]);
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /VUMLO__FILES__S3__ACCESS_KEY/);
+
+  // The proxy: only for https addresses on real hostnames.
+  const px = join(work, "wire-proxy");
+  r = await go([...base, "--dir", px, "--origin", "https://lms.example.edu", "--admin-origin", "https://admin.lms.example.edu"]);
+  assert.equal(r.code, 0, r.out);
+  assert.match(text(px, "vumlo.toml"), /^client_ip_header = "x-real-ip"$/m);
+  assert.equal(text(px, "caddy.env"), "VUMLO_DOMAIN=lms.example.edu\nVUMLO_ADMIN_DOMAIN=admin.lms.example.edu\n");
+  assert.match(r.out, /sudo tee -a \/etc\/default\/caddy < caddy\.env/);
+  const plain = join(work, "wire-plain");
+  r = await go([...base, "--dir", plain]);
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!existsSync(join(plain, "caddy.env")) && /^# client_ip_header/m.test(text(plain, "vumlo.toml")), "no proxy settings for localhost");
+  assert.ok(!/^\[mail\]/m.test(text(plain, "vumlo.toml")) && /^storage = "local"$/m.test(text(plain, "vumlo.toml")), "nothing asked, nothing changed");
+  for (const bad of [["--mail", "maybe"], ["--files", "gcs"], ["--mail", "yes"]]) assert.notEqual((await go([...base, "--dir", join(work, "wire-bad"), ...bad])).code, 0, bad.join(" "));
+}
 rmSync(work, { recursive: true, force: true });
 console.log("ok (install and update, fixtures)");
