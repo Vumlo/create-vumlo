@@ -111,6 +111,151 @@ assert.equal(caddyEnv("https://10.0.0.5", "https://10.0.0.5:8443"), null);
 assert.equal(caddyEnv("https://lms.example.edu", "http://admin.lms.example.edu"), null);
 console.log("ok (mail, files, proxy)");
 
+// ADR-0096: the checks that run before anything is written or started. Fake servers on local ports; no network.
+import { createServer as netServer } from "node:net";
+import { createServer as httpServer } from "node:http";
+import tlsLib from "node:tls";
+import { checkS3, checkSmtp, signV4 } from "./checks.mjs";
+{
+  // The documented SigV4 example "GET Object" (AWS docs, Signature Version 4, header-based authentication).
+  const signed = signV4({
+    method: "GET", url: "https://examplebucket.s3.amazonaws.com/test.txt", region: "us-east-1", service: "s3",
+    accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    date: new Date("2013-05-24T00:00:00Z"), headers: { range: "bytes=0-9" },
+  });
+  assert.match(signed.authorization, /Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41$/);
+  assert.match(signed.authorization, /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20130524\/us-east-1\/s3\/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, /);
+
+  // A scripted SMTP server: PLAIN and LOGIN with one right password, STARTTLS when it has a certificate.
+  const pems = (() => {
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "create-vumlo-cert-"));
+      execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", join(dir, "k.pem"), "-out", join(dir, "c.pem"), "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"], { stdio: "ignore" });
+      return { key: readFileSync(join(dir, "k.pem")), cert: readFileSync(join(dir, "c.pem")) };
+    } catch {
+      return null;
+    }
+  })();
+  const fakeSmtp = async ({ password = "right", certs, implicit = false, silent = false, caps = "AUTH PLAIN LOGIN" } = {}) => {
+    const serve = (sock) => {
+      let buf = "";
+      let step = "";
+      const say = (s) => sock.write(`${s}\r\n`);
+      const onLine = (line) => {
+        if (step === "login-user") {
+          step = "login-pass";
+          return say("334 UGFzc3dvcmQ6");
+        }
+        if (step === "login-pass") {
+          step = "";
+          return Buffer.from(line, "base64").toString() === password ? say("235 2.7.0 accepted") : say("535 5.7.8 authentication failed");
+        }
+        if (/^EHLO /i.test(line)) return say(["250-fake.example", ...(certs && !sock.encrypted ? ["250-STARTTLS"] : []), `250 ${caps}`].join("\r\n"));
+        if (/^STARTTLS/i.test(line)) {
+          say("220 go ahead");
+          sock.removeAllListeners("data");
+          const secure = new tlsLib.TLSSocket(sock, { isServer: true, secureContext: tlsLib.createSecureContext(certs) });
+          secure.encrypted = true;
+          secure.on("error", () => {});
+          return serve(secure);
+        }
+        if (/^AUTH PLAIN /i.test(line)) {
+          const [, u, pw] = Buffer.from(line.slice(11), "base64").toString().split("\0");
+          return u && pw === password ? say("235 2.7.0 accepted") : say("535 5.7.8 authentication failed");
+        }
+        if (/^AUTH LOGIN/i.test(line)) {
+          step = "login-user";
+          return say("334 VXNlcm5hbWU6");
+        }
+        if (/^QUIT/i.test(line)) {
+          say("221 bye");
+          return sock.end();
+        }
+        return say("500 what");
+      };
+      sock.on("data", (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf("\r\n")) >= 0) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          onLine(line);
+        }
+      });
+      sock.on("error", () => {});
+      if (!silent && !sock.encrypted) say("220 fake ESMTP");
+    };
+    const server = implicit
+      ? tlsLib.createServer(certs, (s) => {
+          s.encrypted = true;
+          say220(s);
+          serve(s);
+        })
+      : netServer(serve);
+    const say220 = (s) => s.write("220 fake ESMTP\r\n");
+    server.on("tlsClientError", () => {});
+    await new Promise((done) => server.listen(0, "127.0.0.1", done));
+    return { port: server.address().port, close: () => server.close() };
+  };
+  const smtp = (port, extra = {}) => ({ host: "127.0.0.1", port, tls: "none", user: "u", ...extra });
+
+  let s = await fakeSmtp();
+  await checkSmtp(smtp(s.port), "right");
+  await checkSmtp(smtp(s.port, { user: "" }), "");
+  await assert.rejects(() => checkSmtp(smtp(s.port), "SECRET-wrong"), (e) => /535 5\.7\.8 authentication failed/.test(e.message) && !e.message.includes("SECRET-wrong"));
+  s.close();
+  s = await fakeSmtp({ caps: "AUTH LOGIN" });
+  await checkSmtp(smtp(s.port), "right");
+  await assert.rejects(() => checkSmtp(smtp(s.port), "wrong"), /535/);
+  s.close();
+  s = await fakeSmtp({ caps: "8BITMIME" });
+  await assert.rejects(() => checkSmtp(smtp(s.port), "right"), /offers no AUTH/);
+  s.close();
+  s = await fakeSmtp({ silent: true });
+  await assert.rejects(() => checkSmtp(smtp(s.port), "right", { timeout: 200 }), /no answer/);
+  s.close();
+  await assert.rejects(() => checkSmtp(smtp(1), "right"), /cannot connect to 127\.0\.0\.1:1/);
+
+  if (pems) {
+    s = await fakeSmtp({ certs: pems });
+    await checkSmtp(smtp(s.port, { tls: "starttls" }), "right", { ca: pems.cert });
+    await assert.rejects(() => checkSmtp(smtp(s.port, { tls: "starttls" }), "right"), /certificate is not trusted.*--skip-checks/s);
+    s.close();
+    s = await fakeSmtp({ certs: pems, implicit: true });
+    await checkSmtp(smtp(s.port, { tls: "tls" }), "right", { ca: pems.cert });
+    await assert.rejects(() => checkSmtp(smtp(s.port, { tls: "tls" }), "wrong", { ca: pems.cert }), /535/);
+    s.close();
+  } else console.log("skipped the TLS checks (no openssl)");
+
+  // A fake bucket: answers by the access key it is given, and records what it was sent.
+  const seen = [];
+  const bucket = httpServer((req, res) => {
+    seen.push(req.headers.authorization);
+    const key = /Credential=([^/]+)\//.exec(req.headers.authorization ?? "")?.[1];
+    if (req.url === "/gone") {
+      res.writeHead(404);
+      return res.end();
+    }
+    if (key === "moved") {
+      res.writeHead(301, { "x-amz-bucket-region": "eu-west-1" });
+      return res.end();
+    }
+    res.writeHead(key === "good" ? 200 : 403);
+    res.end();
+  });
+  await new Promise((done) => bucket.listen(0, "127.0.0.1", done));
+  const endpoint = `http://127.0.0.1:${bucket.address().port}`;
+  await checkS3({ endpoint, bucket: "vumlo", region: "eu-north-1" }, { accessKey: "good", secretKey: "s" });
+  assert.match(seen[0], /^AWS4-HMAC-SHA256 Credential=good\/\d{8}\/eu-north-1\/s3\/aws4_request, /);
+  await assert.rejects(() => checkS3({ endpoint, bucket: "vumlo", region: "eu-north-1" }, { accessKey: "bad", secretKey: "SECRET-key" }), (e) => /403.*keys/.test(e.message) && !e.message.includes("SECRET-key"));
+  await assert.rejects(() => checkS3({ endpoint, bucket: "gone", region: "eu-north-1" }, { accessKey: "good", secretKey: "s" }), /no bucket "gone"/);
+  await assert.rejects(() => checkS3({ endpoint, bucket: "vumlo", region: "eu-north-1" }, { accessKey: "moved", secretKey: "s" }), /region eu-west-1/);
+  await assert.rejects(() => checkS3({ endpoint: "http://127.0.0.1:1", bucket: "b", region: "r" }, { accessKey: "good", secretKey: "s" }), /cannot reach 127\.0\.0\.1:1/);
+  bucket.close();
+}
+console.log("ok (checks)");
+
+
 // `npx` runs the program through a symlink: it must still start (0.1.0 and 0.2.0 silently did nothing then).
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, symlinkSync } from "node:fs";
