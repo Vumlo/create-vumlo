@@ -31,8 +31,40 @@ export const MODULE_SETTINGS = {
   },
 };
 
+// The address of the admin console (ADR-0095), a second origin next to the public one: with a domain, `admin.` in front of
+// its host; for localhost or an IP address, the next port. The administrator may give another.
+export function defaultAdminOrigin(origin) {
+  const url = new URL(origin);
+  if (/^[a-z]/i.test(url.hostname) && url.hostname !== "localhost" && url.hostname.includes(".")) return `${url.protocol}//admin.${url.host}`;
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80)) + 1;
+  return `${url.protocol}//${url.hostname}:${port}`;
+}
+
+// Throws what is wrong with `adminOrigin`: it must be an origin, and not the public one.
+export function checkAdminOrigin(adminOrigin, origin) {
+  let url;
+  try {
+    url = new URL(adminOrigin);
+  } catch {
+    throw new Error(`the admin address "${adminOrigin}" must start with a scheme, as in https://admin.lms.example.edu`);
+  }
+  if (!/^https?:$/.test(url.protocol)) throw new Error(`the admin address "${adminOrigin}" must start with http:// or https://`);
+  if (url.pathname !== "/" || url.search || url.hash) throw new Error(`the admin address "${adminOrigin}" must have no path: just scheme, host and port`);
+  if (url.origin === new URL(origin).origin) throw new Error("the admin address must differ from the public address: the console is its own origin");
+}
+
+// `server.admin_origin` of a vumlo.toml, or undefined when it has none (it is required since 0.7.0).
+export const adminOriginIn = (text) => /^admin_origin = "(.*)"$/m.exec(text)?.[1];
+
+// Puts `admin_origin` under `public_origin`; throws when there is no such line to put it under.
+export function withAdminOrigin(text, adminOrigin) {
+  const line = /^public_origin = ".*"$/m;
+  if (!line.test(text)) throw new Error("vumlo.toml has no public_origin line to put admin_origin under: add admin_origin to [server] yourself");
+  return text.replace(line, (l) => `${l}\nadmin_origin = ${JSON.stringify(adminOrigin)}`);
+}
+
 // `settings`: { module: { endpoint, model } } for the modules that have them; they get a table of their own.
-export function patchToml(text, { name, mode, origin, modules, short, accent, domains = [], language, timeZone, settings = {} }) {
+export function patchToml(text, { name, mode, origin, adminOrigin, modules, short, accent, domains = [], language, timeZone, settings = {} }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`vumlo.toml: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -40,6 +72,8 @@ export function patchToml(text, { name, mode, origin, modules, short, accent, do
   set(/^name = "Vumlo"$/m, `name = ${JSON.stringify(name)}`);
   set(/^mode = "university"$/m, `mode = "${mode}"`);
   set(/^public_origin = ".*"$/m, `public_origin = ${JSON.stringify(origin)}`);
+  // The example of a release before 0.7.0 has no such line, and its server does not know the key.
+  if (/^admin_origin = ".*"$/m.test(text)) set(/^admin_origin = ".*"$/m, `admin_origin = ${JSON.stringify(adminOrigin ?? defaultAdminOrigin(origin))}`);
   if (short) set(/^# short_name = ".*$/m, `short_name = ${JSON.stringify(short)}`);
   if (accent && accent !== "violet") {
     if (!/^# accent = ".*$/m.test(text)) {
@@ -464,6 +498,8 @@ export function composeVersionOf(text) {
 export function entriesToReplace(archiveEntries, installEntries) {
   const skip = new Set(KEEP);
   for (const part of ["web", "desktop"]) if (!installEntries.includes(part)) skip.add(part);
+  // The admin console is built with the web app and has no use without it (ADR-0095).
+  if (!installEntries.includes("web")) skip.add("web-admin");
   return archiveEntries.filter((e) => !skip.has(e));
 }
 
@@ -493,6 +529,21 @@ async function update(f) {
       return;
     }
 
+    // A release that needs `server.admin_origin` (0.7.0 and later) does not start without it. It is asked for once, here, and never
+    // written without an answer: a bad one stops the update before any file is touched.
+    const publicNow = /^public_origin = "(.*)"$/m.exec(read("vumlo.toml"))?.[1];
+    const needsAdminOrigin =
+      existsSync(join(fresh, "deploy/vumlo.example.toml")) &&
+      adminOriginIn(readFileSync(join(fresh, "deploy/vumlo.example.toml"), "utf8")) !== undefined &&
+      adminOriginIn(read("vumlo.toml")) === undefined;
+    let adminOrigin = f["admin-origin"];
+    if (needsAdminOrigin && publicNow) {
+      if (adminOrigin === undefined && !f.yes && process.stdin.isTTY) {
+        adminOrigin = ok(await p.text({ message: "This release has an admin console. Its address (administrators sign in there)", placeholder: defaultAdminOrigin(publicNow), defaultValue: defaultAdminOrigin(publicNow) }));
+      }
+      if (adminOrigin !== undefined) checkAdminOrigin(adminOrigin, publicNow);
+    }
+
     const entries = entriesToReplace(readdirSync(fresh), readdirSync(dir));
     // A web service dropped at install time stays dropped.
     const compose = read("deploy/compose.yaml");
@@ -520,11 +571,16 @@ async function update(f) {
       throw new Error(`${err.message}. The previous files are back (from ${backup}).`);
     }
     s.stop(`Replaced ${entries.join(", ")}`);
+    if (needsAdminOrigin && adminOrigin !== undefined) {
+      writeFileSync(join(dir, "vumlo.toml"), withAdminOrigin(read("vumlo.toml"), adminOrigin));
+      p.log.success(`Wrote server.admin_origin = ${adminOrigin} to vumlo.toml`);
+    }
 
     p.note(
       [
         `cd ${dir}`,
         `# Read "Upgrade notes" in CHANGELOG.md (${old ?? "?"} -> ${next}).`,
+        ...(needsAdminOrigin && adminOrigin === undefined ? [`# This release needs server.admin_origin in vumlo.toml, the admin console's own address: add it under public_origin (for example admin_origin = "${publicNow ? defaultAdminOrigin(publicNow) : "https://admin.lms.example.edu"}"), or run again with --admin-origin.`] : []),
         "./vumlo config check && ./vumlo brand apply   # web/ was replaced, and the generated brand files lived there",
         "deploy/update.sh --docker                     # backs up the database, stops the services, rebuilds, migrates, starts",
         "",
@@ -617,6 +673,7 @@ async function main() {
       name: { type: "string" },
       mode: { type: "string" },
       origin: { type: "string" },
+      "admin-origin": { type: "string" }, // the admin console's own address (default: admin. before the host, or the next port on localhost)
       "short-name": { type: "string" }, // the name in "Vumlo | <short name>"
       accent: { type: "string" }, // violet | blue | teal | green | orange | red (needs a 0.5.0 release for anything but violet)
       domains: { type: "string" }, // comma separated email domains that may sign up themselves ("" for nobody)
@@ -695,6 +752,10 @@ async function main() {
     const origin = await ask(f.origin, "http://localhost:3000", () =>
       p.text({ message: "Public address (what people will type)", placeholder: "https://lms.example.edu", defaultValue: "http://localhost:3000" }),
     );
+    const adminOrigin = await ask(f["admin-origin"], defaultAdminOrigin(origin), () =>
+      p.text({ message: "Address of the admin console (administrators sign in there)", placeholder: defaultAdminOrigin(origin), defaultValue: defaultAdminOrigin(origin) }),
+    );
+    checkAdminOrigin(adminOrigin, origin);
     const domains = parseDomains(
       await ask(f.domains, "", () =>
         p.text({
@@ -792,13 +853,15 @@ async function main() {
     // Only what was picked stays on disk. The desktop app builds from web/, so web/ stays for either.
     if (!parts.includes("web") && !parts.includes("desktop")) rmSync(join(dir, "web"), { recursive: true, force: true });
     if (!parts.includes("desktop")) rmSync(join(dir, "desktop"), { recursive: true, force: true });
+    // The admin console is built with the web app (ADR-0095).
+    if (!parts.includes("web")) rmSync(join(dir, "web-admin"), { recursive: true, force: true });
     if (!parts.includes("web")) {
       const compose = join(dir, "deploy/compose.yaml");
       writeFileSync(compose, dropWebService(readFileSync(compose, "utf8")));
     }
 
     const read = (rel) => readFileSync(join(dir, rel), "utf8");
-    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, modules, short, accent, domains, language, timeZone, settings }));
+    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, adminOrigin, modules, short, accent, domains, language, timeZone, settings }));
     writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules, keys }));
     chmodSync(join(dir, ".env"), 0o600);
     if (plugins.length) addPlugins(dir, scratch, plugins);
@@ -806,7 +869,7 @@ async function main() {
     const installed = `Installed: backend${parts.map((x) => ` + ${x}`).join("")}${modules.map((m) => ` + ${m}`).join("")}${plugins.map((n) => ` + plugin ${n}`).join("")}. Secrets are in ${join(dir, ".env")}.`;
     if (start) {
       p.log.success(installed);
-      setup = { dir, admin, plugins, consent, origin };
+      setup = { dir, admin, plugins, consent, origin, adminOrigin };
     } else {
       p.note(
         [
@@ -818,6 +881,7 @@ async function main() {
           "./vumlo db migrate",
           "./vumlo admin create you@example.edu --name Your --surname Name",
           "docker compose up -d && ./vumlo doctor",
+          ...(adminOriginIn(readFileSync(join(dir, "vumlo.toml"), "utf8")) ? [`# The admin console is ${adminOrigin} (docker compose starts it on 127.0.0.1:3001; a domain needs its own Caddy block, docs/install.md)`] : []),
           ...(plugins.length ? ["", "# Plugins: each registers once the core is up (VUMLO__PLUGINS__SECRET_KEY is set in .env).", ...pluginSteps(plugins)] : []),
           "",
           "# To look around first, after the migration: ./vumlo seed --demo",
@@ -843,6 +907,7 @@ async function main() {
     p.note(
       [
         `Open ${setup.origin}`,
+        ...(adminOriginIn(readFileSync(join(setup.dir, "vumlo.toml"), "utf8")) ? [`Administration is at ${setup.adminOrigin}: the same email and password, its own sign-in`] : []),
         ...(a ? [`Sign in as ${a.email}${a.generated ? `  with the password ${a.password}  (shown once: change it)` : ""}`] : ["No administrator yet: ./vumlo admin create you@example.edu --name Your --surname Name"]),
         "",
         `cd ${setup.dir}`,
