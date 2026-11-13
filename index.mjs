@@ -9,6 +9,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import * as p from "@clack/prompts";
+import { checkS3, checkSmtp } from "./checks.mjs";
 
 const REPO = "Vumlo/vumlo-core";
 
@@ -40,6 +41,45 @@ export function defaultAdminOrigin(origin) {
   return `${url.protocol}//${url.hostname}:${port}`;
 }
 
+// A real hostname (not localhost, not an IP address): the only kind a certificate and a DNS record are for.
+const isDomain = (host) => /^[a-z]/i.test(host) && host !== "localhost" && host.includes(".");
+
+export const defaultPort = (tls) => ({ starttls: 587, tls: 465, none: 25 })[tls];
+
+// Outgoing mail (ADR-0084): null unless it was asked for. Throws what is wrong, in words for the person who typed it.
+export function mailSettings({ mail, from, host, tls = "starttls", port, user = "" }, name, origin) {
+  if (mail !== "yes") return null;
+  if (!host) throw new Error("mail needs the SMTP host (--mail-host)");
+  if (!["starttls", "tls", "none"].includes(tls)) throw new Error(`the mail encryption must be starttls, tls or none, not "${tls}"`);
+  const number = port === undefined || port === "" ? defaultPort(tls) : Number(port);
+  if (!Number.isInteger(number) || number < 1 || number > 65535) throw new Error(`the mail port must be 1 to 65535, not "${port}"`);
+  return { from: from || `${name.replace(/[<>"]/g, "")} <no-reply@${new URL(origin).hostname}>`, host, tls, port: number, user };
+}
+
+// Where uploaded files live (ADR-0069): the local directory, or an S3 bucket (AWS, or a service with an https endpoint).
+export function filesSettings({ files = "local", endpoint, bucket, region }) {
+  if (!["local", "s3"].includes(files)) throw new Error(`the file storage must be local or s3, not "${files}"`);
+  if (files === "local") return { storage: "local" };
+  if (!bucket) throw new Error("S3 needs the bucket (--s3-bucket)");
+  if (endpoint) {
+    let url;
+    try {
+      url = new URL(endpoint);
+    } catch {
+      throw new Error(`the S3 endpoint "${endpoint}" must be an address like https://s3.example.edu`);
+    }
+    if (url.protocol !== "https:") throw new Error("the S3 endpoint must start with https://");
+  }
+  return { storage: "s3", endpoint: endpoint || undefined, bucket, region: region || "eu-north-1" };
+}
+
+// What deploy/Caddyfile reads: the two domains, for /etc/default/caddy. Only for two real https hostnames.
+export function caddyEnv(origin, adminOrigin) {
+  const [a, b] = [origin, adminOrigin].map((o) => new URL(o));
+  if (a.protocol !== "https:" || b.protocol !== "https:" || !isDomain(a.hostname) || !isDomain(b.hostname)) return null;
+  return `VUMLO_DOMAIN=${a.hostname}\nVUMLO_ADMIN_DOMAIN=${b.hostname}\n`;
+}
+
 // Throws what is wrong with `adminOrigin`: it must be an origin, and not the public one.
 export function checkAdminOrigin(adminOrigin, origin) {
   let url;
@@ -64,7 +104,7 @@ export function withAdminOrigin(text, adminOrigin) {
 }
 
 // `settings`: { module: { endpoint, model } } for the modules that have them; they get a table of their own.
-export function patchToml(text, { name, mode, origin, adminOrigin, modules, short, accent, domains = [], language, timeZone, settings = {} }) {
+export function patchToml(text, { name, mode, origin, adminOrigin, modules, short, accent, domains = [], language, timeZone, settings = {}, mail, files, proxy }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`vumlo.toml: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -85,6 +125,25 @@ export function patchToml(text, { name, mode, origin, adminOrigin, modules, shor
   if (language && language !== "en") set(/^# language = "en".*$/m, `language = ${JSON.stringify(language)}`);
   if (timeZone && timeZone !== "UTC") set(/^# time_zone = ".*$/m, `time_zone = ${JSON.stringify(timeZone)}`);
   if (origin.startsWith("https://")) set(/^cookie_secure = false.*$/m, "cookie_secure = true");
+  // Behind a proxy that overwrites X-Real-IP (deploy/Caddyfile does), the login limits see the client and not the proxy.
+  if (proxy) set(/^# client_ip_header = "x-real-ip"$/m, 'client_ip_header = "x-real-ip"');
+  if (mail) {
+    set(/^# \[mail\]$/m, "[mail]");
+    set(/^# from = .*$/m, `from = ${JSON.stringify(mail.from)}`);
+    set(/^# \[mail\.transport\]$/m, "[mail.transport]");
+    set(/^# kind = "smtp".*$/m, 'kind = "smtp"');
+    set(/^# host = .*$/m, `host = ${JSON.stringify(mail.host)}`);
+    set(/^# port = 587.*$/m, `port = ${mail.port}`);
+    set(/^# tls = .*$/m, `tls = "${mail.tls}"`);
+    if (mail.user) set(/^# username = .*$/m, `username = ${JSON.stringify(mail.user)}`);
+  }
+  if (files?.storage === "s3") {
+    set(/^storage = "local".*$/m, 'storage = "s3"');
+    set(/^# \[files\.s3\].*$/m, "[files.s3]");
+    if (files.endpoint) set(/^# endpoint = "https:\/\/s3\.example\.edu".*$/m, `endpoint = ${JSON.stringify(files.endpoint)}`);
+    set(/^# bucket = .*$/m, `bucket = ${JSON.stringify(files.bucket)}`);
+    set(/^# region = .*$/m, `region = ${JSON.stringify(files.region)}`);
+  }
   if (modules.length) {
     const plain = modules.filter((m) => !settings[m]);
     const tables = modules.filter((m) => settings[m]).map((m) => [`[modules.${m}]`, "enabled = true", ...Object.entries(settings[m]).map(([k, v]) => `${k} = ${JSON.stringify(v)}`)].join("\n"));
@@ -94,7 +153,7 @@ export function patchToml(text, { name, mode, origin, adminOrigin, modules, shor
 }
 
 // `keys`: { VARIABLE: value } of the secrets of modules, written after the rest (empty: left to be filled in later).
-export function patchEnv(text, { password, modules, keys = {} }) {
+export function patchEnv(text, { password, modules, keys = {}, secrets = {} }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`.env: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -102,6 +161,13 @@ export function patchEnv(text, { password, modules, keys = {} }) {
   set(/^DATABASE_URL=.*$/m, `DATABASE_URL=postgres://vumlo:${password}@postgres:5432/vumlo`);
   set(/^POSTGRES_PASSWORD=.*$/m, `POSTGRES_PASSWORD=${password}`);
   if (modules.length) set(/^# VUMLO_FEATURES=$/m, `VUMLO_FEATURES=${modules.join(",")}`);
+  // The secrets of the mail server and the bucket. Single quotes: docker compose and vumlo-cli each strip one pair, and compose
+  // does not expand `$` or start a comment at ` #` inside them. An empty one is not written (the example's line stays).
+  for (const [name, value] of Object.entries(secrets)) {
+    if (!value) continue;
+    if (/['\r\n]/.test(value)) throw new Error(`${name} cannot hold a single quote or a line break: set a value without one`);
+    text = setEnvVar(text, name, `'${value}'`);
+  }
   const lines = Object.entries(keys).map(([name, value]) => `${name}=${value}\n`);
   return lines.length ? `${text.replace(/\n*$/, "\n")}\n# Keys of the modules.\n${lines.join("")}` : text;
 }
@@ -180,6 +246,15 @@ function unpack(dest, { file, bytes }) {
 
 // A new empty folder under the system temp dir, made by us and removed by the caller.
 const tempDir = () => mkdtempSync(join(tmpdir(), "create-vumlo-"));
+
+// Written into an installation as soon as it is unpacked and removed when the run is over: a folder that has it is an
+// unfinished installation of ours, the only kind a retry may remove (ADR-0096).
+export const UNFINISHED = ".create-vumlo-unfinished";
+
+// Everything inside `dir`, not `dir` itself.
+export function removeContents(dir) {
+  for (const e of readdirSync(dir)) rmSync(join(dir, e), { recursive: true, force: true });
+}
 
 // "a,b" -> ["a", "b"]; "all" -> every available plugin. A name the release lacks is an error that lists the ones it has.
 export function resolvePlugins(list, available) {
@@ -288,6 +363,20 @@ function step(dir, label, args, opts) {
   return r.out;
 }
 
+// An unfinished installation (it has the marker) is removed with its containers and volumes, so that the database password
+// of the new run cannot meet the volume of the old one. Docker being absent or failing is a warning: the files go anyway.
+async function startOver(dir, quiet) {
+  if (!quiet && !ok(await p.confirm({ message: `${dir} holds an unfinished installation. Remove it and start over?`, initialValue: true }))) {
+    throw new Error(`${dir} is left as it is.`);
+  }
+  if (existsSync(join(dir, "deploy/compose.yaml")) && hasDocker()) {
+    p.log.step("Removing the containers and volumes of the unfinished installation");
+    const r = runIn(dir, ["docker", "compose", "-f", "deploy/compose.yaml", "down", "-v", "--remove-orphans"], { capture: true });
+    if (r.status !== 0) p.log.warn(`docker compose down failed, the files are removed anyway:\n${r.out.trim()}`);
+  }
+  removeContents(dir);
+}
+
 // Builds and starts each plugin on its own. One that does not build or start is reported and left out; the others run.
 // Returns the names that are up. The files of a failed one stay, `plugins register` tries it again.
 function startPlugins(dir, names) {
@@ -393,6 +482,8 @@ async function bringUp(dir, { admin, plugins, consent }) {
   }
   if (doctor.status !== 0) throw new Error(`vumlo doctor still fails:\n${doctor.out.trim()}\nThe files are in ${dir}; see docs/install.md.`);
   if (plugins.length) await registerPlugins(dir, startPlugins(dir, plugins), consent);
+  // Done: the services stop, the data stays. The administrator puts the proxy and DNS in place, then starts it (ADR-0096).
+  step(dir, "Stopping the services (the data stays)", ["docker", "compose", "down"]);
 }
 
 export function dropWebService(text) {
@@ -673,6 +764,17 @@ async function main() {
       name: { type: "string" },
       mode: { type: "string" },
       origin: { type: "string" },
+      mail: { type: "string" }, // yes | no: outgoing mail (sign-up, password reset, mail plugins); the password: VUMLO__MAIL__TRANSPORT__PASSWORD
+      "mail-from": { type: "string" },
+      "mail-host": { type: "string" },
+      "mail-tls": { type: "string" }, // starttls | tls | none
+      "mail-port": { type: "string" },
+      "mail-user": { type: "string" },
+      files: { type: "string" }, // local | s3; the keys: VUMLO__FILES__S3__ACCESS_KEY and VUMLO__FILES__S3__SECRET_KEY
+      "s3-endpoint": { type: "string" }, // https only; empty: AWS
+      "s3-bucket": { type: "string" },
+      "s3-region": { type: "string" },
+      "skip-checks": { type: "boolean" }, // do not log in to the mail server and ask the bucket before writing anything
       "admin-origin": { type: "string" }, // the admin console's own address (default: admin. before the host, or the next port on localhost)
       "short-name": { type: "string" }, // the name in "Vumlo | <short name>"
       accent: { type: "string" }, // violet | blue | teal | green | orange | red (needs a 0.5.0 release for anything but violet)
@@ -711,7 +813,10 @@ async function main() {
   const dir = resolve(
     await ask(f.dir, "vumlo", () => p.text({ message: "Where to install?", placeholder: "vumlo", defaultValue: "vumlo" })),
   );
-  if (existsSync(dir) && readdirSync(dir).length) throw new Error(`${dir} is not empty.`);
+  if (existsSync(dir) && readdirSync(dir).length) {
+    if (!existsSync(join(dir, UNFINISHED))) throw new Error(`${dir} is not empty.`);
+    await startOver(dir, quiet);
+  }
 
   const s = p.spinner();
   const created = !existsSync(dir);
@@ -722,6 +827,7 @@ async function main() {
     const rel = f.archive ? { tag: "local archive" } : await fetchRelease(f.version);
     mkdirSync(dir, { recursive: true });
     unpack(dir, { file: f.archive && resolve(f.archive), bytes: rel.bytes });
+    writeFileSync(join(dir, UNFINISHED), "");
     s.stop(`Unpacked ${rel.tag}`);
 
     const found = existsSync(join(dir, "backend/crates/modules")) ? readdirSync(join(dir, "backend/crates/modules")) : [];
@@ -829,6 +935,58 @@ async function main() {
           : [];
     if (!available.length && f.plugins === undefined && !quiet) p.log.info("The plugins release has no plugins.");
 
+    // What the first run needs (ADR-0096): outgoing mail and where files live, checked before anything is written or started.
+    const required = (v) => (v?.trim() ? undefined : "required");
+    if (f.mail !== undefined && !["yes", "no"].includes(f.mail)) throw new Error(`--mail takes yes or no, not "${f.mail}"`);
+    const mailAnswers = {
+      mail: f.mail ?? (quiet ? "no" : ok(await p.confirm({ message: "Send mail? (sign-up, password reset and mail plugins need it)", initialValue: false })) ? "yes" : "no"),
+    };
+    let mailPassword = "";
+    if (mailAnswers.mail === "yes") {
+      mailAnswers.host = await ask(f["mail-host"], "", () => p.text({ message: "SMTP host", placeholder: "smtp.example.edu", validate: required }));
+      mailAnswers.tls = await ask(f["mail-tls"], "starttls", () =>
+        p.select({ message: "Encryption", options: [{ value: "starttls", hint: "port 587" }, { value: "tls", hint: "port 465" }, { value: "none", hint: "port 25, a local server" }] }),
+      );
+      const port = String(defaultPort(mailAnswers.tls) ?? "");
+      mailAnswers.port = await ask(f["mail-port"], port, () => p.text({ message: "Port", placeholder: port, defaultValue: port }));
+      mailAnswers.user = await ask(f["mail-user"], "", () => p.text({ message: "User name (empty: no login)", defaultValue: "" }));
+      const fallbackFrom = mailSettings({ mail: "yes", host: "x" }, name, origin).from;
+      mailAnswers.from = await ask(f["mail-from"], fallbackFrom, () => p.text({ message: "Sender", placeholder: fallbackFrom, defaultValue: fallbackFrom }));
+      mailPassword = process.env.VUMLO__MAIL__TRANSPORT__PASSWORD ?? (quiet || !mailAnswers.user ? "" : ok(await p.password({ message: "SMTP password" })));
+    }
+    const mail = mailSettings(mailAnswers, name, origin);
+    const filesAnswers = {
+      files: await ask(f.files, "local", () =>
+        p.select({ message: "Where do uploaded files live?", options: [{ value: "local", label: "On this server (a directory)" }, { value: "s3", label: "In an S3 bucket" }] }),
+      ),
+    };
+    if (filesAnswers.files === "s3") {
+      filesAnswers.endpoint = await ask(f["s3-endpoint"], "", () => p.text({ message: "S3 endpoint (empty: AWS)", placeholder: "https://s3.example.edu", defaultValue: "" }));
+      filesAnswers.bucket = await ask(f["s3-bucket"], "", () => p.text({ message: "S3 bucket", validate: required }));
+      filesAnswers.region = await ask(f["s3-region"], "eu-north-1", () => p.text({ message: "S3 region", placeholder: "eu-north-1", defaultValue: "eu-north-1" }));
+    }
+    const files = filesSettings(filesAnswers);
+    const s3Keys = { accessKey: "", secretKey: "" };
+    if (files.storage === "s3") {
+      s3Keys.accessKey = process.env.VUMLO__FILES__S3__ACCESS_KEY ?? (quiet ? "" : ok(await p.password({ message: "S3 access key" })));
+      s3Keys.secretKey = process.env.VUMLO__FILES__S3__SECRET_KEY ?? (quiet ? "" : ok(await p.password({ message: "S3 secret key" })));
+    }
+    if (!f["skip-checks"]) {
+      if (mail) {
+        s.start("Checking the mail server");
+        await checkSmtp(mail, mailPassword);
+        s.stop("The mail server accepts the login");
+      }
+      if (files.storage === "s3") {
+        if (!s3Keys.accessKey || !s3Keys.secretKey) throw new Error("S3 needs the keys: set VUMLO__FILES__S3__ACCESS_KEY and VUMLO__FILES__S3__SECRET_KEY in the environment (or --skip-checks to fill them in .env later)");
+        s.start("Checking the bucket");
+        await checkS3(files, s3Keys);
+        s.stop("The bucket answers");
+      }
+    } else if (files.storage === "s3" && !(s3Keys.accessKey && s3Keys.secretKey)) {
+      p.log.warn("The S3 keys are not set: put VUMLO__FILES__S3__ACCESS_KEY and VUMLO__FILES__S3__SECRET_KEY in .env before starting.");
+    }
+
     // Whether to go on and run it: the steps of docs/install.md, with the administrator asked for here.
     const docker = hasDocker();
     if (!docker && !quiet && f.start === undefined) p.log.info("Docker with Compose was not found: the installer only prepares the files.");
@@ -861,16 +1019,35 @@ async function main() {
     }
 
     const read = (rel) => readFileSync(join(dir, rel), "utf8");
-    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, adminOrigin, modules, short, accent, domains, language, timeZone, settings }));
-    writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), { password: randomBytes(18).toString("hex"), modules, keys }));
+    writeFileSync(join(dir, "vumlo.toml"), patchToml(read("deploy/vumlo.example.toml"), { name, mode, origin, adminOrigin, modules, short, accent, domains, language, timeZone, settings, mail, files, proxy: origin.startsWith("https://") }));
+    writeFileSync(join(dir, ".env"), patchEnv(read("deploy/env.example"), {
+        password: randomBytes(18).toString("hex"),
+        modules,
+        keys,
+        secrets: { VUMLO__MAIL__TRANSPORT__PASSWORD: mail ? mailPassword : "", VUMLO__FILES__S3__ACCESS_KEY: s3Keys.accessKey, VUMLO__FILES__S3__SECRET_KEY: s3Keys.secretKey },
+      }));
     chmodSync(join(dir, ".env"), 0o600);
+    // For /etc/default/caddy (deploy/Caddyfile reads the two domains from there): only for two real https hostnames.
+    const caddy = caddyEnv(origin, adminOrigin);
+    if (caddy) writeFileSync(join(dir, "caddy.env"), caddy);
+    const proxyNote = caddy
+      ? [
+          "",
+          "# The proxy: Caddy in front, with the two domains in caddy.env. It must overwrite X-Real-IP:",
+          "# vumlo.toml has server.client_ip_header, which trusts it.",
+          "sudo cp deploy/Caddyfile /etc/caddy/Caddyfile",
+          "sudo tee -a /etc/default/caddy < caddy.env",
+          "sudo systemctl restart caddy",
+        ]
+      : [];
     if (plugins.length) addPlugins(dir, scratch, plugins);
 
     const installed = `Installed: backend${parts.map((x) => ` + ${x}`).join("")}${modules.map((m) => ` + ${m}`).join("")}${plugins.map((n) => ` + plugin ${n}`).join("")}. Secrets are in ${join(dir, ".env")}.`;
     if (start) {
       p.log.success(installed);
-      setup = { dir, admin, plugins, consent, origin, adminOrigin };
+      setup = { dir, admin, plugins, consent, origin, adminOrigin, proxyNote };
     } else {
+      rmSync(join(dir, UNFINISHED), { force: true });
       p.note(
         [
           `cd ${dir}`,
@@ -882,6 +1059,7 @@ async function main() {
           "./vumlo admin create you@example.edu --name Your --surname Name",
           "docker compose up -d && ./vumlo doctor",
           ...(adminOriginIn(readFileSync(join(dir, "vumlo.toml"), "utf8")) ? [`# The admin console is ${adminOrigin} (docker compose starts it on 127.0.0.1:3001; a domain needs its own Caddy block, docs/install.md)`] : []),
+          ...proxyNote,
           ...(plugins.length ? ["", "# Plugins: each registers once the core is up (VUMLO__PLUGINS__SECRET_KEY is set in .env).", ...pluginSteps(plugins)] : []),
           "",
           "# To look around first, after the migration: ./vumlo seed --demo",
@@ -894,7 +1072,9 @@ async function main() {
     }
   } catch (e) {
     s.stop("Failed");
+    // The folder was empty when the run began (or did not exist), so everything in it is this run's.
     if (created) rmSync(dir, { recursive: true, force: true });
+    else if (existsSync(dir)) removeContents(dir);
     throw e;
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -903,21 +1083,27 @@ async function main() {
   // Outside the try above: a step that fails here must not remove the files that were just written.
   if (setup) {
     await bringUp(setup.dir, setup);
+    rmSync(join(setup.dir, UNFINISHED), { force: true });
     const { admin: a } = setup;
     p.note(
       [
-        `Open ${setup.origin}`,
+        "The installation is done and the services are stopped; the data stays. Start it:",
+        `cd ${setup.dir}`,
+        `export COMPOSE_FILE=deploy/compose.yaml${setup.plugins.length ? ":plugins/compose.yaml" : ""} COMPOSE_ENV_FILES=.env`,
+        "docker compose up -d",
+        "",
+        `Then open ${setup.origin}`,
         ...(adminOriginIn(readFileSync(join(setup.dir, "vumlo.toml"), "utf8")) ? [`Administration is at ${setup.adminOrigin}: the same email and password, its own sign-in`] : []),
         ...(a ? [`Sign in as ${a.email}${a.generated ? `  with the password ${a.password}  (shown once: change it)` : ""}`] : ["No administrator yet: ./vumlo admin create you@example.edu --name Your --surname Name"]),
+        ...setup.proxyNote,
         "",
-        `cd ${setup.dir}`,
-        "./vumlo seed --demo      # sample data, to look around",
-        "./vumlo doctor           # check the installation",
+        "./vumlo seed --demo      # sample data, once it runs",
+        "./vumlo doctor           # check the installation, once it runs",
         "npx create-vumlo update  # later, a newer release; the guide is docs/install.md (TLS, mail, upgrades, backups)",
       ].join("\n"),
-      "Running",
+      "Installed",
     );
-    p.outro("Vumlo is running.");
+    p.outro("Vumlo is installed and stopped.");
   }
 }
 

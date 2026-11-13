@@ -7,7 +7,8 @@
     "create-vumlo": "index.mjs"
   },
   "files": [
-    "index.mjs"
+    "index.mjs",
+    "checks.mjs"
   ],
   "engines": {
     "node": ">=20"
