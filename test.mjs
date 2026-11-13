@@ -20,6 +20,8 @@ assert.match(env, /^VUMLO_FEATURES=vpl,ai-agent$/m);
 
 const compose = dropWebService(read("compose.yaml"));
 assert.ok(!/^  web:/m.test(compose) && /^volumes:/m.test(compose) && /^  worker:/m.test(compose));
+// The admin console is built from web-admin/, which goes with the web app (ADR-0095): its service goes too.
+assert.ok(!/^  console:/m.test(compose), "the console service is dropped with the web service");
 console.log("ok");
 
 // The questions added in 0.2.0.
