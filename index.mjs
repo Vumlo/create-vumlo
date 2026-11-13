@@ -1095,7 +1095,6 @@ async function main() {
         `Then open ${setup.origin}`,
         ...(adminOriginIn(readFileSync(join(setup.dir, "vumlo.toml"), "utf8")) ? [`Administration is at ${setup.adminOrigin}: the same email and password, its own sign-in`] : []),
         ...(a ? [`Sign in as ${a.email}${a.generated ? `  with the password ${a.password}  (shown once: change it)` : ""}`] : ["No administrator yet: ./vumlo admin create you@example.edu --name Your --surname Name"]),
-        "",
         ...setup.proxyNote,
         "",
         "./vumlo seed --demo      # sample data, once it runs",
