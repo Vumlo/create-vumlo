@@ -479,7 +479,7 @@ exit 0
   assert.equal(r.code, 0, r.out);
   const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
   const at = (re) => calls.findIndex((c) => re.test(c));
-  const order = [/^vumlo config check/, /^vumlo brand apply/, /^docker compose build/, /^docker compose up -d --wait postgres/, /^vumlo db migrate/, /^vumlo admin create a@example.edu --name Admin --surname Admin --password-stdin/, /^docker compose up -d$/, /^vumlo doctor/, /^docker compose up -d --build plugin-ical-feed$/, /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant none.*--dry-run/, /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant read:courses,read:grades --courses all$/, /^docker compose up -d plugin-/];
+  const order = [/^vumlo config check/, /^vumlo brand apply/, /^docker compose build/, /^docker compose up -d --wait postgres/, /^vumlo db migrate/, /^vumlo admin create a@example.edu --name Admin --surname Admin --password-stdin/, /^docker compose up -d$/, /^vumlo doctor/, /^docker compose up -d --build plugin-ical-feed$/, /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant none.*--dry-run/, /^vumlo plugin install http:\/\/plugin-ical-feed:8000 --grant read:courses,read:grades --courses all$/, /^docker compose up -d plugin-/, /^docker compose down$/];
   let from = -1;
   for (const re of order) {
     const i = calls.findIndex((c, j) => j > from && re.test(c));
@@ -490,7 +490,10 @@ exit 0
   assert.ok(!calls.some((c) => /correct horse/.test(c) && !c.startsWith("pw=")), "the password is never an argument");
   assert.match(text(start, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=tok-http:\/\/plugin-ical-feed:8000$/m);
   assert.match(text(start, ".env"), /^PLUGIN_TEXT_METRICS_SECRET=sec-http:\/\/plugin-text-metrics:8000$/m);
-  assert.match(r.out, /Vumlo is running/);
+  assert.match(r.out, /Vumlo is installed and stopped/);
+  assert.match(r.out, /docker compose up -d/, "the note says how to start it");
+  assert.ok(!calls.some((c) => /^docker compose down.*-v/.test(c)), "the data stays");
+  assert.ok(!existsSync(join(start, ".create-vumlo-unfinished")), "the marker goes after the services are stopped");
   assert.ok(!/ports:/.test(text(start, "plugins/compose.yaml")), "every plugin listens on 8000 in a container of its own: nothing is published, so no port clashes");
 
   // A plugin that does not build is left out: the install finishes, the others are registered, nothing waits for it.
@@ -515,6 +518,7 @@ exit 0
   assert.match(r.out, /boom/);
   assert.ok(existsSync(join(kept2, "vumlo.toml")) && existsSync(join(kept2, ".env")), "the files stay after a failed step");
   assert.ok(!readFileSync(log, "utf8").includes("db migrate"), "nothing runs after the failed step");
+  assert.ok(!/docker compose down/.test(readFileSync(log, "utf8")), "a failed run is left as it is, for its output to be read");
 
   // Without --start, and without a terminal, nothing is run.
   rmSync(log, { force: true });
@@ -535,7 +539,7 @@ exit 0
   assert.match(text(mixed, ".env"), /^PLUGIN_AT_RISK_STUDENTS_TOKEN=tok-/m);
   assert.match(text(mixed, ".env"), /^PLUGIN_ICAL_FEED_TOKEN=$/m);
   assert.ok(!readFileSync(log, "utf8").split("\n").some((c) => /plugin install http:\/\/plugin-ical-feed:8000 --grant read/.test(c)), "the refused plugin is not registered");
-  assert.match(r.out, /Vumlo is running/, "the run goes on to the end, with the administrator's note");
+  assert.match(r.out, /Vumlo is installed and stopped/, "the run goes on to the end, with the administrator's note");
 
   // `plugins register` takes the ones without a token (the fixed plugin, later) and only those.
   rmSync(log, { force: true });

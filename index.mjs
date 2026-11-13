@@ -482,6 +482,8 @@ async function bringUp(dir, { admin, plugins, consent }) {
   }
   if (doctor.status !== 0) throw new Error(`vumlo doctor still fails:\n${doctor.out.trim()}\nThe files are in ${dir}; see docs/install.md.`);
   if (plugins.length) await registerPlugins(dir, startPlugins(dir, plugins), consent);
+  // Done: the services stop, the data stays. The administrator puts the proxy and DNS in place, then starts it (ADR-0096).
+  step(dir, "Stopping the services (the data stays)", ["docker", "compose", "down"]);
 }
 
 export function dropWebService(text) {
@@ -1085,20 +1087,24 @@ async function main() {
     const { admin: a } = setup;
     p.note(
       [
-        `Open ${setup.origin}`,
+        "The installation is done and the services are stopped; the data stays. Start it:",
+        `cd ${setup.dir}`,
+        `export COMPOSE_FILE=deploy/compose.yaml${setup.plugins.length ? ":plugins/compose.yaml" : ""} COMPOSE_ENV_FILES=.env`,
+        "docker compose up -d",
+        "",
+        `Then open ${setup.origin}`,
         ...(adminOriginIn(readFileSync(join(setup.dir, "vumlo.toml"), "utf8")) ? [`Administration is at ${setup.adminOrigin}: the same email and password, its own sign-in`] : []),
         ...(a ? [`Sign in as ${a.email}${a.generated ? `  with the password ${a.password}  (shown once: change it)` : ""}`] : ["No administrator yet: ./vumlo admin create you@example.edu --name Your --surname Name"]),
         "",
         ...setup.proxyNote,
         "",
-        `cd ${setup.dir}`,
-        "./vumlo seed --demo      # sample data, to look around",
-        "./vumlo doctor           # check the installation",
+        "./vumlo seed --demo      # sample data, once it runs",
+        "./vumlo doctor           # check the installation, once it runs",
         "npx create-vumlo update  # later, a newer release; the guide is docs/install.md (TLS, mail, upgrades, backups)",
       ].join("\n"),
-      "Running",
+      "Installed",
     );
-    p.outro("Vumlo is running.");
+    p.outro("Vumlo is installed and stopped.");
   }
 }
 
