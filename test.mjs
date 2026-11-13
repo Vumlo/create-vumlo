@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { adminOriginIn, checkAdminOrigin, defaultAdminOrigin, defaultShort, dropWebService, guessDomain, parseDomains, patchEnv, patchToml, withAdminOrigin } from "./index.mjs";
+import { adminOriginIn, caddyEnv, checkAdminOrigin, defaultAdminOrigin, defaultPort, defaultShort, dropWebService, filesSettings, guessDomain, mailSettings, parseDomains, patchEnv, patchToml, withAdminOrigin } from "./index.mjs";
 
 // Run against the real example files of the sibling checkout: a release that changes them breaks this.
 const core = new URL("../vumlo-core/deploy/", import.meta.url);
@@ -57,6 +57,59 @@ const noAccent = withAccent.replace(/^# accent = .*\n/m, "");
 assert.doesNotThrow(() => patchToml(noAccent, { ...base, accent: "violet" }));
 assert.throws(() => patchToml(noAccent, { ...base, accent: "red" }), /older than 0\.5\.0/);
 console.log("ok (accent)");
+
+// ADR-0096: mail, file storage and the proxy settings, written into the real example files.
+const origin = "https://lms.example.edu";
+const mail = mailSettings({ mail: "yes", host: "smtp.example.edu", user: "vumlo" }, "Example", origin);
+assert.deepEqual(mail, { from: "Example <no-reply@lms.example.edu>", host: "smtp.example.edu", tls: "starttls", port: 587, user: "vumlo" });
+assert.equal(mailSettings({}, "X", origin), null, "mail is off unless asked for");
+assert.equal(mailSettings({ mail: "yes", host: "h", tls: "tls" }, "X", origin).port, 465);
+assert.equal(mailSettings({ mail: "yes", host: "h", tls: "none" }, "X", origin).port, 25);
+assert.equal(mailSettings({ mail: "yes", host: "h", from: "Me <me@x.edu>" }, "X", origin).from, "Me <me@x.edu>");
+assert.equal(mailSettings({ mail: "yes", host: "h" }, 'A <"B">', origin).from, "A B <no-reply@lms.example.edu>");
+assert.throws(() => mailSettings({ mail: "yes" }, "X", origin), /host/);
+assert.throws(() => mailSettings({ mail: "yes", host: "h", tls: "ssl" }, "X", origin), /starttls, tls or none/);
+assert.throws(() => mailSettings({ mail: "yes", host: "h", port: "70000" }, "X", origin), /port/);
+assert.equal(defaultPort("starttls"), 587);
+
+assert.deepEqual(filesSettings({}), { storage: "local" });
+assert.deepEqual(filesSettings({ files: "s3", bucket: "b" }), { storage: "s3", endpoint: undefined, bucket: "b", region: "eu-north-1" });
+assert.deepEqual(filesSettings({ files: "s3", bucket: "b", endpoint: "https://s3.example.edu", region: "r" }), { storage: "s3", endpoint: "https://s3.example.edu", bucket: "b", region: "r" });
+assert.throws(() => filesSettings({ files: "s3" }), /bucket/);
+assert.throws(() => filesSettings({ files: "s3", bucket: "b", endpoint: "http://s3.example.edu" }), /https/);
+assert.throws(() => filesSettings({ files: "gcs" }), /local or s3/);
+
+const exampleToml = read("vumlo.example.toml");
+const none = patchToml(exampleToml, { ...base, origin });
+const withMail = patchToml(exampleToml, { ...base, origin, mail });
+assert.match(withMail, /^\[mail\]\nfrom = "Example <no-reply@lms\.example\.edu>"$/m);
+assert.match(withMail, /^\[mail\.transport\]\nkind = "smtp"\nhost = "smtp\.example\.edu"\nport = 587\ntls = "starttls"\nusername = "vumlo"$/m);
+assert.ok(!/^password\s*=/m.test(withMail), "the password is never in vumlo.toml");
+assert.match(withMail, /^# link_base = /m, "what was not asked stays as the example has it");
+assert.ok(!/^\[mail\]/m.test(none) && patchToml(exampleToml, { ...base, origin, mail: null }) === none, "no mail answer, no change");
+assert.match(patchToml(exampleToml, { ...base, origin, mail: { ...mail, user: "" } }), /^# username = /m, "no login, no username line");
+assert.match(patchToml(exampleToml, { ...base, origin, files: { storage: "local" } }), /^storage = "local"/m);
+const s3 = patchToml(exampleToml, { ...base, origin, files: filesSettings({ files: "s3", bucket: "vumlo-files", endpoint: "https://s3.example.edu" }) });
+assert.match(s3, /^storage = "s3"/m);
+assert.match(s3, /^\[files\.s3\]\nendpoint = "https:\/\/s3\.example\.edu"\nbucket = "vumlo-files"\nregion = "eu-north-1"$/m);
+assert.match(s3, /^# endpoint = "https:\/\/api\.openai\.com\/v1"$/m, "the Buddy's endpoint is not touched");
+assert.ok(!/^endpoint/m.test(patchToml(exampleToml, { ...base, origin, files: filesSettings({ files: "s3", bucket: "b" }) })), "AWS needs no endpoint");
+assert.match(patchToml(exampleToml, { ...base, origin, proxy: true }), /^client_ip_header = "x-real-ip"$/m);
+assert.match(none, /^# client_ip_header = "x-real-ip"$/m);
+
+const envSecrets = patchEnv(read("env.example"), { password: "pw", modules: [], secrets: { VUMLO__MAIL__TRANSPORT__PASSWORD: "smtp pw", VUMLO__FILES__S3__ACCESS_KEY: "AK", VUMLO__FILES__S3__SECRET_KEY: "" } });
+// Single quotes: docker compose and vumlo-cli both strip one pair, and compose does not expand `$` inside them.
+assert.match(envSecrets, /^VUMLO__MAIL__TRANSPORT__PASSWORD='smtp pw'$/m);
+assert.match(envSecrets, /^VUMLO__FILES__S3__ACCESS_KEY='AK'$/m);
+assert.match(patchEnv(read("env.example"), { password: "pw", modules: [], secrets: { VUMLO__MAIL__TRANSPORT__PASSWORD: "p#ss $x" } }), /^VUMLO__MAIL__TRANSPORT__PASSWORD='p#ss \$x'$/m);
+assert.throws(() => patchEnv(read("env.example"), { password: "pw", modules: [], secrets: { VUMLO__MAIL__TRANSPORT__PASSWORD: "it's" } }), /single quote or a line break/);
+assert.ok(!/^VUMLO__FILES__S3__SECRET_KEY=/m.test(envSecrets), "an empty secret is not written");
+
+assert.equal(caddyEnv("https://lms.example.edu", "https://admin.lms.example.edu"), "VUMLO_DOMAIN=lms.example.edu\nVUMLO_ADMIN_DOMAIN=admin.lms.example.edu\n");
+assert.equal(caddyEnv("http://localhost:3000", "http://localhost:3001"), null);
+assert.equal(caddyEnv("https://10.0.0.5", "https://10.0.0.5:8443"), null);
+assert.equal(caddyEnv("https://lms.example.edu", "http://admin.lms.example.edu"), null);
+console.log("ok (mail, files, proxy)");
 
 // `npx` runs the program through a symlink: it must still start (0.1.0 and 0.2.0 silently did nothing then).
 import { execFileSync } from "node:child_process";

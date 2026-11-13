@@ -40,6 +40,45 @@ export function defaultAdminOrigin(origin) {
   return `${url.protocol}//${url.hostname}:${port}`;
 }
 
+// A real hostname (not localhost, not an IP address): the only kind a certificate and a DNS record are for.
+const isDomain = (host) => /^[a-z]/i.test(host) && host !== "localhost" && host.includes(".");
+
+export const defaultPort = (tls) => ({ starttls: 587, tls: 465, none: 25 })[tls];
+
+// Outgoing mail (ADR-0084): null unless it was asked for. Throws what is wrong, in words for the person who typed it.
+export function mailSettings({ mail, from, host, tls = "starttls", port, user = "" }, name, origin) {
+  if (mail !== "yes") return null;
+  if (!host) throw new Error("mail needs the SMTP host (--mail-host)");
+  if (!["starttls", "tls", "none"].includes(tls)) throw new Error(`the mail encryption must be starttls, tls or none, not "${tls}"`);
+  const number = port === undefined || port === "" ? defaultPort(tls) : Number(port);
+  if (!Number.isInteger(number) || number < 1 || number > 65535) throw new Error(`the mail port must be 1 to 65535, not "${port}"`);
+  return { from: from || `${name.replace(/[<>"]/g, "")} <no-reply@${new URL(origin).hostname}>`, host, tls, port: number, user };
+}
+
+// Where uploaded files live (ADR-0069): the local directory, or an S3 bucket (AWS, or a service with an https endpoint).
+export function filesSettings({ files = "local", endpoint, bucket, region }) {
+  if (!["local", "s3"].includes(files)) throw new Error(`the file storage must be local or s3, not "${files}"`);
+  if (files === "local") return { storage: "local" };
+  if (!bucket) throw new Error("S3 needs the bucket (--s3-bucket)");
+  if (endpoint) {
+    let url;
+    try {
+      url = new URL(endpoint);
+    } catch {
+      throw new Error(`the S3 endpoint "${endpoint}" must be an address like https://s3.example.edu`);
+    }
+    if (url.protocol !== "https:") throw new Error("the S3 endpoint must start with https://");
+  }
+  return { storage: "s3", endpoint: endpoint || undefined, bucket, region: region || "eu-north-1" };
+}
+
+// What deploy/Caddyfile reads: the two domains, for /etc/default/caddy. Only for two real https hostnames.
+export function caddyEnv(origin, adminOrigin) {
+  const [a, b] = [origin, adminOrigin].map((o) => new URL(o));
+  if (a.protocol !== "https:" || b.protocol !== "https:" || !isDomain(a.hostname) || !isDomain(b.hostname)) return null;
+  return `VUMLO_DOMAIN=${a.hostname}\nVUMLO_ADMIN_DOMAIN=${b.hostname}\n`;
+}
+
 // Throws what is wrong with `adminOrigin`: it must be an origin, and not the public one.
 export function checkAdminOrigin(adminOrigin, origin) {
   let url;
@@ -64,7 +103,7 @@ export function withAdminOrigin(text, adminOrigin) {
 }
 
 // `settings`: { module: { endpoint, model } } for the modules that have them; they get a table of their own.
-export function patchToml(text, { name, mode, origin, adminOrigin, modules, short, accent, domains = [], language, timeZone, settings = {} }) {
+export function patchToml(text, { name, mode, origin, adminOrigin, modules, short, accent, domains = [], language, timeZone, settings = {}, mail, files, proxy }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`vumlo.toml: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -85,6 +124,25 @@ export function patchToml(text, { name, mode, origin, adminOrigin, modules, shor
   if (language && language !== "en") set(/^# language = "en".*$/m, `language = ${JSON.stringify(language)}`);
   if (timeZone && timeZone !== "UTC") set(/^# time_zone = ".*$/m, `time_zone = ${JSON.stringify(timeZone)}`);
   if (origin.startsWith("https://")) set(/^cookie_secure = false.*$/m, "cookie_secure = true");
+  // Behind a proxy that overwrites X-Real-IP (deploy/Caddyfile does), the login limits see the client and not the proxy.
+  if (proxy) set(/^# client_ip_header = "x-real-ip"$/m, 'client_ip_header = "x-real-ip"');
+  if (mail) {
+    set(/^# \[mail\]$/m, "[mail]");
+    set(/^# from = .*$/m, `from = ${JSON.stringify(mail.from)}`);
+    set(/^# \[mail\.transport\]$/m, "[mail.transport]");
+    set(/^# kind = "smtp".*$/m, 'kind = "smtp"');
+    set(/^# host = .*$/m, `host = ${JSON.stringify(mail.host)}`);
+    set(/^# port = 587.*$/m, `port = ${mail.port}`);
+    set(/^# tls = .*$/m, `tls = "${mail.tls}"`);
+    if (mail.user) set(/^# username = .*$/m, `username = ${JSON.stringify(mail.user)}`);
+  }
+  if (files?.storage === "s3") {
+    set(/^storage = "local".*$/m, 'storage = "s3"');
+    set(/^# \[files\.s3\].*$/m, "[files.s3]");
+    if (files.endpoint) set(/^# endpoint = "https:\/\/s3\.example\.edu".*$/m, `endpoint = ${JSON.stringify(files.endpoint)}`);
+    set(/^# bucket = .*$/m, `bucket = ${JSON.stringify(files.bucket)}`);
+    set(/^# region = .*$/m, `region = ${JSON.stringify(files.region)}`);
+  }
   if (modules.length) {
     const plain = modules.filter((m) => !settings[m]);
     const tables = modules.filter((m) => settings[m]).map((m) => [`[modules.${m}]`, "enabled = true", ...Object.entries(settings[m]).map(([k, v]) => `${k} = ${JSON.stringify(v)}`)].join("\n"));
@@ -94,7 +152,7 @@ export function patchToml(text, { name, mode, origin, adminOrigin, modules, shor
 }
 
 // `keys`: { VARIABLE: value } of the secrets of modules, written after the rest (empty: left to be filled in later).
-export function patchEnv(text, { password, modules, keys = {} }) {
+export function patchEnv(text, { password, modules, keys = {}, secrets = {} }) {
   const set = (re, to) => {
     if (!re.test(text)) throw new Error(`.env: the example has no line matching ${re}`);
     text = text.replace(re, () => to);
@@ -102,6 +160,13 @@ export function patchEnv(text, { password, modules, keys = {} }) {
   set(/^DATABASE_URL=.*$/m, `DATABASE_URL=postgres://vumlo:${password}@postgres:5432/vumlo`);
   set(/^POSTGRES_PASSWORD=.*$/m, `POSTGRES_PASSWORD=${password}`);
   if (modules.length) set(/^# VUMLO_FEATURES=$/m, `VUMLO_FEATURES=${modules.join(",")}`);
+  // The secrets of the mail server and the bucket. Single quotes: docker compose and vumlo-cli each strip one pair, and compose
+  // does not expand `$` or start a comment at ` #` inside them. An empty one is not written (the example's line stays).
+  for (const [name, value] of Object.entries(secrets)) {
+    if (!value) continue;
+    if (/['\r\n]/.test(value)) throw new Error(`${name} cannot hold a single quote or a line break: set a value without one`);
+    text = setEnvVar(text, name, `'${value}'`);
+  }
   const lines = Object.entries(keys).map(([name, value]) => `${name}=${value}\n`);
   return lines.length ? `${text.replace(/\n*$/, "\n")}\n# Keys of the modules.\n${lines.join("")}` : text;
 }
