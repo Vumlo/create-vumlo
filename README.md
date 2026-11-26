@@ -31,11 +31,32 @@ default):
 | Web app? Desktop app? | `--parts web,desktop` (`""` for the backend alone) | web |
 | Modules of the release (only if it has any) | `--modules a,b` | none |
 | Plugins of the latest vumlo-plugins release | `--plugins a,b,c`, `--plugins all`, `--plugins ""` for none | none |
+| Send mail? (sign-up, password reset and mail plugins need it) | `--mail yes\|no` | no |
+| SMTP host, encryption (starttls, tls, none), port, user name (empty: no login), sender | `--mail-host`, `--mail-tls`, `--mail-port`, `--mail-user`, `--mail-from` | starttls, its port (587, 465 or 25), no login, `Name <no-reply@host>` |
+| Where uploaded files live: local or S3 | `--files local\|s3` | local |
+| S3 endpoint (empty: AWS, https only), bucket, region | `--s3-endpoint`, `--s3-bucket`, `--s3-region` | AWS, none, `eu-north-1` |
+| Do not check the mail server and the bucket | `--skip-checks` | off |
 
 An accent other than violet needs release 0.5.0 or newer; an older one stops with a message saying so.
 
+### Mail, file storage and the proxy
+
+What the first run depends on is asked here, and what can change later is left to the admin console. The SMTP password and
+the S3 keys are never flags: the installer reads `VUMLO__MAIL__TRANSPORT__PASSWORD`, `VUMLO__FILES__S3__ACCESS_KEY` and
+`VUMLO__FILES__S3__SECRET_KEY` from the environment (asking, hidden, on a terminal when they are not set) and writes them to
+`.env` in single quotes, never to `vumlo.toml`. A value with a single quote or a line break is refused.
+
+Before anything is written or started, the installer **checks** them: it logs in to the SMTP server (and sends nothing) and
+asks the bucket with a signed `HEAD`. A wrong password or key stops the run in seconds, with the server's own words and
+nothing left behind. The checks use only Node, so they run where you type, not where Vumlo will run: for a server this
+computer cannot reach, or one whose certificate comes from a CA that Node does not know, `--skip-checks` writes the
+settings unchecked. When the public address is https on a real hostname, the installer also writes
+`server.client_ip_header = "x-real-ip"` (so the login limits see the client and not the proxy) and a `caddy.env` with
+`VUMLO_DOMAIN` and `VUMLO_ADMIN_DOMAIN`; it prints the commands that put `deploy/Caddyfile` and `caddy.env` in place. Caddy,
+DNS and the firewall are yours.
+
 `--version 0.5.0` takes a release other than the newest. `--archive file.tar.gz` unpacks a local archive instead (no
-checksum is checked). Nothing is installed into a folder that is not empty, and a failed run removes what it made.
+checksum is checked). Nothing is installed into a folder that is not empty, except an unfinished installation of this installer (see "Start over").
 
 The desktop app is built from `web/`, so `web/` stays when either is picked; only the web service of the Compose file is
 dropped when the web app is not.
@@ -98,6 +119,9 @@ Without a terminal nothing is started unless you say so:
 VUMLO_ADMIN_PASSWORD=... npx create-vumlo --yes --start --admin-email you@example.edu --admin-name Your --admin-surname Name --grant-plugins
 ```
 
+A run that ends with the services **stopped**: after `doctor` and the plugin registration it runs `docker compose down` (the data
+stays), and the closing note says how to start it again once the proxy and DNS are in place.
+
 A plugin that cannot be built or started, or cannot be registered (the core refuses its manifest, or it does not answer),
 does not stop the others: it is
 left out, the reason is shown at the end, and the rest run. `npx create-vumlo plugins register [name...]` (inside the
@@ -108,6 +132,14 @@ them: for a declined grant, a fixed plugin, or an interrupted run.
 plugins are left for later and the command to register each is printed. `plugins add` takes `--start` and
 `--grant-plugins` too. Every plugin listens on port 8000 inside a container of its own and publishes nothing, so
 several plugins never clash on a port.
+
+## Start over
+
+A run that fails before the services are started removes everything it made, also inside a folder that existed and was empty.
+A `--start` that fails keeps its files, so the output can be read, and leaves `.create-vumlo-unfinished` in the folder. Run
+the same command again: a folder with that marker is an unfinished installation, and the installer asks (`--yes`: does it)
+to remove it, with `docker compose down -v` first, so the new database password cannot meet the old volume. A folder without
+the marker is never touched. The marker goes when a run is finished.
 
 ## Update
 
@@ -135,7 +167,7 @@ database, stops the services, rebuilds, migrates and starts them.
 
 ## Development
 
-`npm test` checks the edits it makes against the example files of a `vumlo-core` checkout that sits next to this
+The SMTP and S3 checks are in `checks.mjs`. `npm test` checks the edits it makes against the example files of a `vumlo-core` checkout that sits next to this
 folder (`../vumlo-core/deploy/`): a release that changes those files breaks the test, which is the point. It also runs the
 installer and `update` on small fixture archives it builds (no network). A new version is published with `npm publish`
 after `npm test`.
